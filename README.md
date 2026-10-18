@@ -132,10 +132,6 @@ if (message) {
     msg.payload.topic = topic
     msg.payload.sensor = sensor
     msg.payload.chipid = chipid
-
-    /* --- Apenas incluir as novas colunas se existirem no payload de entrada --- */
-    if (typeof xyz.percentual !== 'undefined') msg.payload.percentual = xyz.percentual;
-    if (typeof xyz.status !== 'undefined') msg.payload.status = xyz.status;
 } else {
     msg.payload = null
 }
