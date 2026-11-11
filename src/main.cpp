@@ -82,6 +82,15 @@ PubSubClient mqttClient(netClient);
 uint32_t mqttNextAttempt = 0;
 uint8_t mqttRetry = 0;
 
+// Reconexão ativa de Wi-Fi (o auto-reconnect do core pode falhar)
+// Política: 5 min sem rede -> WiFi.reconnect() a cada 5 min (gentil,
+// tolera queda proposital por manutenção); 8 h sem rede -> reinicia.
+#define WIFI_RECONNECT_AFTER 300000UL   // 5 min
+#define WIFI_RESTART_AFTER 28800000UL   // 8 h
+uint32_t wifiDownSince = 0;             // 0 = Wi-Fi conectado
+uint32_t wifiLastReconnect = 0;
+uint32_t wifiNextStats = 0;             // próximo log de status (60 s)
+
 // --------------------------------------------------
 // Callback do WiFiManager
 // --------------------------------------------------
@@ -750,7 +759,7 @@ button:active{opacity:.85}
 <div class="msg" id="msg3"></div>
 </form>
 </details>
-<div class="hint">Estado sincronizado a cada 2s</div>
+<div class="hint" id="ftr">Estado sincronizado a cada 2s</div>
 </div>
 <script>
 var sw=document.getElementById('sw'),st=document.getElementById('st'),
@@ -758,7 +767,7 @@ lb=document.getElementById('lb'),mb=document.getElementById('mb'),
 c1=document.getElementById('c1'),f7=document.getElementById('f7'),
 c2=document.getElementById('c2'),f8=document.getElementById('f8'),
 sb2=document.getElementById('sb2'),msg2=document.getElementById('msg2'),
-clk=document.getElementById('clk');
+clk=document.getElementById('clk'),ftr=document.getElementById('ftr');
 document.getElementById('ip').textContent=location.hostname;
 
 function render(on){
@@ -775,8 +784,14 @@ function sync(){
     mb.textContent=d.mqtt_connected?'MQTT ativo':(d.mqtt?'MQTT offline':'MQTT off');
     mb.className='badge'+(d.mqtt_connected?' on':'');
     clk.textContent=d.time_synced?('Relogio do aparelho: '+d.clock):'Aguardando sincronismo NTP';
+    if(d.uptime!==undefined)ftr.textContent='Ativo '+fmtUp(d.uptime)+' \u00B7 Heap '+d.heap+' \u00B7 RSSI '+d.rssi+' dBm';
   })
   .catch(function(){st.textContent='SEM CONEXAO';st.className='status';});
+}
+function fmtUp(u){
+ if(u>=86400)return (u/86400).toFixed(u>=864000?0:1)+'d';
+ if(u>=3600)return (u/3600).toFixed(u>=36000?0:1)+'h';
+ return Math.floor(u/60)+'min';
 }
 function tgl(on){
  lb.textContent='...';
@@ -901,7 +916,13 @@ void handleState()
   json += timeSynced() ? "true" : "false";
   json += ",\"clock\":\"";
   json += relogioAtual();
-  json += "\"}";
+  json += "\",\"uptime\":";
+  json += String(millis() / 1000UL);
+  json += ",\"heap\":";
+  json += String(ESP.getFreeHeap());
+  json += ",\"rssi\":";
+  json += String(WiFi.RSSI());
+  json += "}";
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
@@ -1086,6 +1107,10 @@ void setup()
   Serial.begin(115200);
   delay(100);
 
+  // Diagnóstico: revela se o chip reiniciou sozinho (crash/WDT/brownout)
+  Serial.print("Ultimo reset: ");
+  Serial.println(ESP.getResetReason());
+
   // Primeiro lê o estado salvo, depois aplica no pino.
   // A ordem (digitalWrite antes do pinMode) evita o clique
   // no boot nos módulos ativos em LOW.
@@ -1114,6 +1139,27 @@ void setup()
   {
     setRelay(relayState, false);
   }
+
+  // Rádio sempre ativo: o modem sleep padrão causa quedas periódicas
+  // (beacon timeout) com alguns roteadores.
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+
+  // Diagnóstico de queda/conexão com o motivo exato informado pelo core
+  WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &info)
+                                 {
+    Serial.print("Wi-Fi desconectado (motivo ");
+    Serial.print(info.reason);
+    Serial.print(": ");
+    Serial.print(info.ssid);
+    Serial.println(")"); });
+
+  WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP &info)
+                          {
+    Serial.print("Wi-Fi conectado, IP: ");
+    Serial.print(info.ip.toString());
+    Serial.print(" RSSI: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm"); });
 
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
@@ -1276,9 +1322,63 @@ void loop()
     ESP.restart();
   }
 
-  // Log de queda/restauração do Wi-Fi (o core reconecta sozinho)
+  // Log de queda/restauração do Wi-Fi + reconexão ativa.
+  // (o auto-reconnect do core pode falhar; aqui garantimos o fallback)
   static bool wasConnected = true;
   bool connected = (WiFi.status() == WL_CONNECTED);
+  uint32_t agoraMs = millis();
+
+  if (connected)
+  {
+    wifiDownSince = 0;
+  }
+  else
+  {
+    if (wifiDownSince == 0)
+    {
+      wifiDownSince = agoraMs;
+      wifiLastReconnect = agoraMs;
+    }
+
+    // 8 h sem rede: reinicia (o relé volta com o estado salvo no SPIFFS
+    // e o agendamento continua pelo relógio interno; com a rede fora,
+    // ex. manutenção longa, o reboot não afeta a automação)
+    if ((uint32_t)(agoraMs - wifiDownSince) >= WIFI_RESTART_AFTER)
+    {
+      Serial.println("Wi-Fi offline ha 8h, reiniciando...");
+      delay(100);
+      ESP.restart();
+      return;
+    }
+
+    // 5 min sem rede: tenta reconectar a cada 5 min
+    if ((uint32_t)(agoraMs - wifiLastReconnect) >= WIFI_RECONNECT_AFTER)
+    {
+      wifiLastReconnect = agoraMs;
+
+      Serial.print("Wi-Fi offline ha ");
+      Serial.print((agoraMs - wifiDownSince) / 60000UL);
+      Serial.println(" min, tentando reconectar...");
+      WiFi.reconnect();
+    }
+  }
+
+  // Status periódico (60 s): estabilidade, sinal e heap ao longo do tempo
+  if ((int32_t)(agoraMs - wifiNextStats) >= 0)
+  {
+    wifiNextStats = agoraMs + 60000UL;
+
+    Serial.print("[status] uptime=");
+    Serial.print(agoraMs / 1000UL);
+    Serial.print("s heap=");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print(" rssi=");
+    Serial.print(WiFi.RSSI());
+    Serial.print(" wifi=");
+    Serial.print(connected ? "ok" : "down");
+    Serial.print(" mqtt=");
+    Serial.println((mqttEnabled && mqttClient.connected()) ? "ok" : "down");
+  }
 
   if (connected != wasConnected)
   {
