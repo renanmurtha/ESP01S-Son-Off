@@ -27,6 +27,13 @@
 #endif
 
 #define RELAY_PIN 0
+
+// --------------------------------------------------
+// ENDPOINT SECRETO DE RESET DE FÁBRICA (/reset/p=<senha>)
+// Defina a SUA senha após clonar (não commita a senha).
+// Com a linha comentada, o endpoint nem é registrado.
+// --------------------------------------------------
+//#define RESET_PASSWORD "sua-senha-aqui"
 /* AP */
 #define HOST_NAME "ESP01S-RELE"
 /* Servidor web + mDNS (http://esp01s-rele.local) */
@@ -1055,8 +1062,52 @@ void handleRelay()
   handleState();
 }
 
+#ifdef RESET_PASSWORD
+// --------------------------------------------------
+// Endpoint secreto: apaga config.json e as credenciais
+// Wi-Fi e reinicia (volta para o AP do WiFiManager).
+// Senha errada responde 404 com atraso (anti brute force),
+// sem revelar que a rota existe.
+// --------------------------------------------------
+void handleSecretReset(const String &senha)
+{
+  if (senha != RESET_PASSWORD)
+  {
+    Serial.println("Reset: senha incorreta.");
+    delay(1000);
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  Serial.println("Reset: acionado, apagando configuracao...");
+
+  if (SPIFFS.exists("/config.json"))
+  {
+    SPIFFS.remove("/config.json");
+  }
+
+  ESP.eraseConfig();
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", "{\"ok\":true,\"restart\":1}");
+
+  delay(100);
+  ESP.restart();
+}
+#endif
+
 void handleNotFound()
 {
+#ifdef RESET_PASSWORD
+  const char *prefixo = "/reset/p=";
+
+  if (server.uri().startsWith(prefixo))
+  {
+    handleSecretReset(server.uri().substring(strlen(prefixo)));
+    return;
+  }
+#endif
+
   server.send(404, "text/plain", "Not found");
 }
 

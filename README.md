@@ -188,6 +188,19 @@ Fluxo resumido: **broker Aedes (Node-RED) → nó MQTT → Function (acima) → 
   - A cada 60 s, log no serial: uptime, heap livre, RSSI e status Wi-Fi/MQTT (heap caindo ao longo de horas indica fragmentação).
 - Ao voltar a rede: mDNS refeito (com fallback para `esp01s-rele`), backoff do MQTT zerado e reconexão imediata.
 
+### Reset de fábrica (endpoint secreto)
+Para recuperação do aparelho (ex.: perdido na rede com nome/IP que não lembra), existe um endpoint que apaga **toda** a configuração e volta ao estado de primeira utilização.
+
+- **Defina a sua senha após clonar o projeto** (não commita): descomente e edite em `src/main.cpp`:
+  ```cpp
+  #define RESET_PASSWORD "sua-senha-aqui"
+  ```
+- **Sem o `#define` (padrão do repositório), o endpoint nem é registrado** — toda tentativa responde 404, como qualquer rota inexistente.
+- Uso: acesse no navegador `http://<ip>/reset/p=<senha>`.
+  - **Senha correta:** apaga `config.json` (MQTT, mDNS, agendamentos, estado do relé), apaga as credenciais Wi-Fi (`WiFi.eraseConfig`) e reinicia — no boot, o WiFiManager abre o AP `ESP01S-RELE` para configurar do zero. Resposta: `{"ok":true,"restart":1}`.
+  - **Senha errada:** responde 404 com 1 segundo de atraso (dificulta força bruta), sem revelar que a rota existe.
+- Funciona nos dois builds (com e sem MQTT). Vale apenas na rede local, via HTTP — use para recuperação, não como mecanismo remoto de administração.
+
 ### OTA e rede
 - **OTA via rede** (PlatformIO: `upload_protocol = espota`), com o hostname do OTA igual ao do mDNS.
 - Durante o OTA os reinícios agendados são cancelados, o loop de MQTT/agendamento é pausado e (no build com MQTT) o cliente MQTT é desconectado.
