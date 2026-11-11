@@ -710,7 +710,8 @@ padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
 h1{margin:0;font-size:clamp(15px,4.5vw,18px);font-weight:600;letter-spacing:.4px}
 .badge{font-size:11px;padding:2px 8px;border-radius:10px;background:#232833;color:#8a91a0}
 .badge.on{background:rgba(34,197,94,.16);color:var(--on)}
-.ip{margin:4px 0 14px;font-size:clamp(11px,3vw,13px);color:#8a91a0;word-break:break-all}
+.ip{margin:4px 0 14px;display:flex;justify-content:space-between;align-items:baseline;
+font-size:clamp(11px,3vw,13px);color:#8a91a0;word-break:break-all}
 .row{display:flex;align-items:center;justify-content:space-between;gap:12px;
 background:#12151c;border:1px solid #262b36;border-radius:12px;padding:14px}
 .row .lbl{font-size:15px;font-weight:600}
@@ -721,6 +722,9 @@ background:#12151c;border:1px solid #262b36;border-radius:12px;padding:14px}
 background:#fff;transition:.2s}
 .sw input:checked+.track{background:var(--on);box-shadow:0 0 16px rgba(34,197,94,.45)}
 .sw input:checked+.track:before{transform:translateX(28px)}
+input:disabled+.track{opacity:.6}
+.aviso{display:none;font-size:11px;font-weight:600;color:#f87171}
+.aviso.on{display:block}
 details{margin-top:14px;border-top:1px solid #262b36;padding-top:12px}
 summary{cursor:pointer;font-size:14px;font-weight:600;color:#8a91a0;list-style:none}
 summary::-webkit-details-marker{display:none}
@@ -750,7 +754,7 @@ button:active{opacity:.85}
   R"HTML(<span class="badge" id="mb">MQTT</span>)HTML"
 #endif
   R"HTML(</div>
-<p class="ip" id="ip"></p>
+<p class="ip"><span id="ip"></span><span class="aviso" id="aviso"></span></p>
 <div class="row">
 <span class="lbl" id="lb">...</span>
 <label class="sw"><input type="checkbox" id="sw" onchange="tgl(this.checked)"><span class="track"></span></label>
@@ -820,13 +824,17 @@ lb=document.getElementById('lb'),
 c1=document.getElementById('c1'),f7=document.getElementById('f7'),
 c2=document.getElementById('c2'),f8=document.getElementById('f8'),
 sb2=document.getElementById('sb2'),msg2=document.getElementById('msg2'),
-clk=document.getElementById('clk'),ftr=document.getElementById('ftr');
+clk=document.getElementById('clk'),ftr=document.getElementById('ftr'),
+aviso=document.getElementById('aviso');
 )HTML"
 #ifdef USE_MQTT
   R"HTML(var mb=document.getElementById('mb');
 )HTML"
 #endif
   R"HTML(document.getElementById('ip').textContent=location.hostname;
+var emAcao=false;
+function avisoOn(t){aviso.textContent=t;aviso.className='aviso on';}
+function avisoOff(){aviso.textContent='';aviso.className='aviso';}
 
 function render(on){
  sw.checked=on;
@@ -836,7 +844,7 @@ function sync(){
  fetch('/api/state',{cache:'no-store'})
   .then(function(r){return r.json();})
   .then(function(d){
-    render(d.relay==='on');
+    if(!emAcao)render(d.relay==='on');
 )HTML"
 #ifdef USE_MQTT
   R"HTML(    mb.textContent=d.mqtt_connected?'MQTT ativo':(d.mqtt?'MQTT offline':'MQTT off');
@@ -845,8 +853,9 @@ function sync(){
 #endif
   R"HTML(    clk.textContent=d.time_synced?('Relogio do aparelho: '+d.clock):'Aguardando sincronismo NTP';
     if(d.uptime!==undefined)ftr.textContent='Ativo '+fmtUp(d.uptime)+' \u00B7 Heap '+d.heap+' \u00B7 RSSI '+d.rssi+' dBm';
+    avisoOff();
   })
-  .catch(function(){lb.textContent='SEM CONEXAO';});
+  .catch(function(){avisoOn('SEM CONEXAO');});
 }
 function fmtUp(u){
  if(u>=86400)return (u/86400).toFixed(u>=864000?0:1)+'d';
@@ -854,11 +863,20 @@ function fmtUp(u){
  return Math.floor(u/60)+'min';
 }
 function tgl(on){
- lb.textContent='...';
+ emAcao=true;
+ sw.disabled=true;
+ avisoOn('Sincronizando...');
  fetch('/relay?state='+(on?'on':'off'))
   .then(function(r){return r.json();})
-  .then(function(d){render(d.relay==='on');})
-  .catch(sync);
+  .then(function(d){
+   render(d.relay==='on');
+   avisoOff();
+  })
+  .catch(sync)
+  .finally(function(){
+   emAcao=false;
+   sw.disabled=false;
+  });
 }
 )HTML"
 #ifdef USE_MQTT
