@@ -4,7 +4,9 @@
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
+#ifdef USE_MQTT
 #include <PubSubClient.h>
+#endif
 #include <ArduinoOTA.h>
 #include <time.h>
 #include <coredecls.h>
@@ -31,7 +33,8 @@
 /* hostname para MDNS.begin, sem .local */
 #define MDNS_HOST "esp01s-rele"
 
-/* JSON config names */
+/* JSON config names (usados apenas no payload MQTT) */
+#ifdef USE_MQTT
 #define SENSOR_NAME "Iluminação"
 #define MECADDRESS String(WiFi.macAddress())
 #define CHIP_ID String(ESP.getChipId())
@@ -40,17 +43,22 @@
 #define COLLECTION "iluminacao"
 #define MQTT_OUTPUT_TOPIC "iot/leds/output"
 #define MQTT_INPUT_TOPIC "iot/leds/input"
+#endif
 
-// Configurações Wi-Fi / MQTT
+#ifdef USE_MQTT
+// Configurações MQTT
 char mqtt_server[64] = "";
 char mqtt_port[6] = "";
 char mqtt_user[32] = "";
 char mqtt_pass[64] = "";
 char mqtt_topic[64] = "";
+#endif
 char mdns_host[32] = "";
 
 bool shouldSaveConfig = false;
+#ifdef USE_MQTT
 bool mqttEnabled = false;
+#endif
 
 // Estado atual do relé (espelhado na página web)
 bool relayState = false;
@@ -74,6 +82,7 @@ bool otaActive = false;
 
 ESP8266WebServer server(80);
 
+#ifdef USE_MQTT
 // Cliente MQTT (tópicos derivados de mqtt_topic)
 WiFiClient netClient;
 PubSubClient mqttClient(netClient);
@@ -81,6 +90,7 @@ PubSubClient mqttClient(netClient);
 // Backoff de reconexão MQTT (não-bloqueante)
 uint32_t mqttNextAttempt = 0;
 uint8_t mqttRetry = 0;
+#endif
 
 // Reconexão ativa de Wi-Fi (o auto-reconnect do core pode falhar)
 // Política: 5 min sem rede -> WiFi.reconnect() a cada 5 min (gentil,
@@ -102,6 +112,7 @@ void saveConfigCallback()
 // --------------------------------------------------
 // Normaliza a config MQTT (porta e tópico padrão)
 // --------------------------------------------------
+#ifdef USE_MQTT
 void normalizeMqttConfig()
 {
   if (strlen(mqtt_server) > 0 && atoi(mqtt_port) <= 0)
@@ -114,6 +125,7 @@ void normalizeMqttConfig()
     strlcpy(mqtt_topic, MQTT_OUTPUT_TOPIC, sizeof(mqtt_topic));
   }
 }
+#endif
 
 // --------------------------------------------------
 // Normaliza o nome mDNS (hostname para MDNS.begin)
@@ -266,11 +278,13 @@ void loadConfig()
     return;
   }
 
+#ifdef USE_MQTT
   strlcpy(mqtt_server, doc["mqtt_server"] | "", sizeof(mqtt_server));
   strlcpy(mqtt_port, doc["mqtt_port"] | "", sizeof(mqtt_port));
   strlcpy(mqtt_user, doc["mqtt_user"] | "", sizeof(mqtt_user));
   strlcpy(mqtt_pass, doc["mqtt_pass"] | "", sizeof(mqtt_pass));
   strlcpy(mqtt_topic, doc["mqtt_topic"] | MQTT_OUTPUT_TOPIC, sizeof(mqtt_topic));
+#endif
   strlcpy(mdns_host, doc["mdns_host"] | MDNS_HOST, sizeof(mdns_host));
 
   relayState = doc["relay_state"] | false;
@@ -280,7 +294,9 @@ void loadConfig()
   schedOnEn = doc["sched_on_en"] | false;
   schedOffEn = doc["sched_off_en"] | false;
 
+#ifdef USE_MQTT
   normalizeMqttConfig();
+#endif
   normalizeMdnsHost();
   normalizeSchedule();
 }
@@ -292,11 +308,13 @@ bool saveConfig()
 {
   StaticJsonDocument<1024> doc;
 
+#ifdef USE_MQTT
   doc["mqtt_server"] = mqtt_server;
   doc["mqtt_port"] = mqtt_port;
   doc["mqtt_user"] = mqtt_user;
   doc["mqtt_pass"] = mqtt_pass;
   doc["mqtt_topic"] = mqtt_topic;
+#endif
   doc["mdns_host"] = mdns_host;
   doc["relay_state"] = relayState;
   doc["sched_on"] = schedOn;
@@ -327,6 +345,7 @@ bool saveConfig()
 // Tópicos MQTT derivados do base configurado:
 //   <base>/set | <base>/state | <base>/availability
 // --------------------------------------------------
+#ifdef USE_MQTT
 String mqttTopic(const char *suffix)
 {
   String base = mqtt_topic;
@@ -379,6 +398,7 @@ void publishRelayState()
     Serial.println(payload);
   }
 }
+#endif // USE_MQTT
 
 // --------------------------------------------------
 // Controle do relé
@@ -400,7 +420,9 @@ void setRelay(bool on, bool persist = true)
 
   if (changed)
   {
+#ifdef USE_MQTT
     publishRelayState();
+#endif
   }
 }
 
@@ -524,6 +546,7 @@ void handleSchedule()
 // --------------------------------------------------
 // Verifica se o MQTT foi configurado
 // --------------------------------------------------
+#ifdef USE_MQTT
 bool hasMqttConfig()
 {
   return strlen(mqtt_server) > 0 && atoi(mqtt_port) > 0 && atoi(mqtt_port) <= 65535;
@@ -655,11 +678,13 @@ void mqttLoop()
     mqttRetry++;
   }
 }
+#endif // USE_MQTT
 
 // --------------------------------------------------
 // Página web (embutida em flash)
 // --------------------------------------------------
-static const char PAGE_INDEX[] PROGMEM = R"HTML(
+static const char PAGE_INDEX[] PROGMEM =
+  R"HTML(
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -689,8 +714,6 @@ background:#12151c;border:1px solid #262b36;border-radius:12px;padding:14px}
 background:#fff;transition:.2s}
 .sw input:checked+.track{background:var(--on);box-shadow:0 0 16px rgba(34,197,94,.45)}
 .sw input:checked+.track:before{transform:translateX(28px)}
-.status{margin:12px 0 0;text-align:center;font-size:clamp(13px,4vw,15px);font-weight:600;color:#8a91a0}
-.status.on{color:var(--on)}
 details{margin-top:14px;border-top:1px solid #262b36;padding-top:12px}
 summary{cursor:pointer;font-size:14px;font-weight:600;color:#8a91a0;list-style:none}
 summary::-webkit-details-marker{display:none}
@@ -714,14 +737,20 @@ button:active{opacity:.85}
 </head>
 <body>
 <div class="card">
-<div class="top"><h1>ESP01S &middot; Rele</h1><span class="badge" id="mb">MQTT</span></div>
+<div class="top"><h1>ESP01S &middot; Rele</h1>
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(<span class="badge" id="mb">MQTT</span>)HTML"
+#endif
+  R"HTML(</div>
 <p class="ip" id="ip"></p>
 <div class="row">
 <span class="lbl" id="lb">...</span>
 <label class="sw"><input type="checkbox" id="sw" onchange="tgl(this.checked)"><span class="track"></span></label>
 </div>
-<p class="status" id="st">-</p>
-<details>
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(<details>
 <summary>Configuracao</summary>
 <form onsubmit="return saveMqtt(event)">
 <label for="f6">URL (DNS)</label>
@@ -730,7 +759,20 @@ button:active{opacity:.85}
 <div class="msg" id="msg"></div>
 </form>
 </details>
-<details>
+)HTML"
+#else
+  R"HTML(<details>
+<summary>Configuracao</summary>
+<form onsubmit="return saveMdns(event)">
+<label for="f6">URL (DNS)</label>
+<input id="f6" name="mdns" autocomplete="off">
+<button type="submit" id="sb">Salvar</button>
+<div class="msg" id="msg"></div>
+</form>
+</details>
+)HTML"
+#endif
+  R"HTML(<details>
 <summary>Automacao</summary>
 <form onsubmit="return saveSched(event)">
 <label class="chk" for="c1"><input type="checkbox" id="c1" name="on_en"> Ligar as</label>
@@ -742,7 +784,9 @@ button:active{opacity:.85}
 </form>
 <div class="hint" id="clk">Relogio: --</div>
 </details>
-<details>
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(<details>
 <summary>MQTT</summary>
 <form onsubmit="return saveMqtt(event)">
 <label for="f1">Servidor</label>
@@ -759,34 +803,43 @@ button:active{opacity:.85}
 <div class="msg" id="msg3"></div>
 </form>
 </details>
-<div class="hint" id="ftr">Estado sincronizado a cada 2s</div>
+)HTML"
+#endif
+  R"HTML(<div class="hint" id="ftr">Estado sincronizado a cada 2s</div>
 </div>
 <script>
-var sw=document.getElementById('sw'),st=document.getElementById('st'),
-lb=document.getElementById('lb'),mb=document.getElementById('mb'),
+var sw=document.getElementById('sw'),
+lb=document.getElementById('lb'),
 c1=document.getElementById('c1'),f7=document.getElementById('f7'),
 c2=document.getElementById('c2'),f8=document.getElementById('f8'),
 sb2=document.getElementById('sb2'),msg2=document.getElementById('msg2'),
 clk=document.getElementById('clk'),ftr=document.getElementById('ftr');
-document.getElementById('ip').textContent=location.hostname;
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(var mb=document.getElementById('mb');
+)HTML"
+#endif
+  R"HTML(document.getElementById('ip').textContent=location.hostname;
 
 function render(on){
  sw.checked=on;
  lb.textContent=on?'LIGADO':'DESLIGADO';
- st.textContent=on?'Rele ligado':'Rele desligado';
- st.className='status'+(on?' on':'');
 }
 function sync(){
  fetch('/api/state',{cache:'no-store'})
   .then(function(r){return r.json();})
   .then(function(d){
     render(d.relay==='on');
-    mb.textContent=d.mqtt_connected?'MQTT ativo':(d.mqtt?'MQTT offline':'MQTT off');
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(    mb.textContent=d.mqtt_connected?'MQTT ativo':(d.mqtt?'MQTT offline':'MQTT off');
     mb.className='badge'+(d.mqtt_connected?' on':'');
-    clk.textContent=d.time_synced?('Relogio do aparelho: '+d.clock):'Aguardando sincronismo NTP';
+)HTML"
+#endif
+  R"HTML(    clk.textContent=d.time_synced?('Relogio do aparelho: '+d.clock):'Aguardando sincronismo NTP';
     if(d.uptime!==undefined)ftr.textContent='Ativo '+fmtUp(d.uptime)+' \u00B7 Heap '+d.heap+' \u00B7 RSSI '+d.rssi+' dBm';
   })
-  .catch(function(){st.textContent='SEM CONEXAO';st.className='status';});
+  .catch(function(){lb.textContent='SEM CONEXAO';});
 }
 function fmtUp(u){
  if(u>=86400)return (u/86400).toFixed(u>=864000?0:1)+'d';
@@ -800,7 +853,9 @@ function tgl(on){
   .then(function(d){render(d.relay==='on');})
   .catch(sync);
 }
-function saveMqtt(e){
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(function saveMqtt(e){
  e.preventDefault();
  // Formulario de origem (Configuracao ou MQTT): botao e msg sao locais ao form
  var form=e.target,btn=form.querySelector('button[type=submit]'),fm=form.querySelector('.msg');
@@ -851,7 +906,9 @@ function carregaForm(){
   })
   .catch(function(){});
 }
-function carregaSched(){
+)HTML"
+#endif
+  R"HTML(function carregaSched(){
  fetch('/api/schedule')
   .then(function(r){return r.json();})
   .then(function(d){
@@ -875,7 +932,8 @@ function saveSched(e){
   .catch(function(){msg2.textContent='Falha ao salvar';sb2.disabled=false;});
  return false;
 }
-// Espera o aparelho voltar (max 15s). alvo='' usa a origem atual.
+)HTML"
+  R"HTML(// Espera o aparelho voltar (max 15s). alvo='' usa a origem atual.
 function esperaBoot(alvo,cb){
  var t=0;
  var iv=setInterval(function(){
@@ -885,8 +943,45 @@ function esperaBoot(alvo,cb){
    .catch(function(){if(t>=15){clearInterval(iv);cb();}});
  },1000);
 }
-carregaForm();
-carregaSched();
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(carregaForm();
+)HTML"
+#else
+  R"HTML(function saveMdns(e){
+ e.preventDefault();
+ var form=e.target,btn=form.querySelector('button[type=submit]'),fm=form.querySelector('.msg');
+ btn.disabled=true; fm.textContent='Salvando...';
+ fetch('/api/mdns',{method:'POST',body:JSON.stringify({mdns:f6.value.trim()})})
+  .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});})
+  .then(function(o){
+   if(!o.ok){fm.textContent=o.d.error||'Erro ao salvar';btn.disabled=false;return;}
+   var n=o.d.restart||1;
+   fm.textContent='Salvo! Reiniciando em '+n+'...';
+   var iv=setInterval(function(){
+    n--;
+    if(n<=0){
+     clearInterval(iv);
+     fm.textContent='Reiniciando...';
+     esperaBoot('',function(){location.reload();});
+     return;
+    }
+    fm.textContent='Salvo! Reiniciando em '+n+'...';
+   },1000);
+  })
+  .catch(function(){fm.textContent='Falha ao salvar';btn.disabled=false;});
+ return false;
+}
+function carregaMdns(){
+ fetch('/api/state',{cache:'no-store'})
+  .then(function(r){return r.json();})
+  .then(function(d){f6.value=d.mdns||'';})
+  .catch(function(){});
+}
+carregaMdns();
+)HTML"
+#endif
+  R"HTML(carregaSched();
 sync();
 setInterval(sync,2000);
 </script>
@@ -908,10 +1003,12 @@ void handleState()
   json += relayState ? "on" : "off";
   json += "\",\"gpio\":";
   json += String(RELAY_PIN);
+#ifdef USE_MQTT
   json += ",\"mqtt\":";
   json += mqttEnabled ? "true" : "false";
   json += ",\"mqtt_connected\":";
   json += (mqttEnabled && mqttClient.connected()) ? "true" : "false";
+#endif
   json += ",\"time_synced\":";
   json += timeSynced() ? "true" : "false";
   json += ",\"clock\":\"";
@@ -922,7 +1019,9 @@ void handleState()
   json += String(ESP.getFreeHeap());
   json += ",\"rssi\":";
   json += String(WiFi.RSSI());
-  json += "}";
+  json += ",\"mdns\":\"";
+  json += mdns_host;
+  json += "\"}";
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
@@ -964,6 +1063,7 @@ void handleNotFound()
 // --------------------------------------------------
 // Configuração MQTT pela página
 // --------------------------------------------------
+#ifdef USE_MQTT
 void handleMqttGet()
 {
   String json = "{\"server\":\"";
@@ -1039,6 +1139,35 @@ void handleMqttPost()
   server.send(200, "application/json",
               "{\"ok\":true,\"restart\":1,\"mdns\":\"" + String(mdns_host) + "\"}");
 }
+#else
+// Build SEM MQTT: o formulário "Configuracao" salva só o nome mDNS
+void handleMdnsPost()
+{
+  StaticJsonDocument<256> doc;
+
+  if (deserializeJson(doc, server.arg("plain")))
+  {
+    server.send(400, "application/json", "{\"error\":\"json invalido\"}");
+    return;
+  }
+
+  strlcpy(mdns_host, doc["mdns"] | MDNS_HOST, sizeof(mdns_host));
+  normalizeMdnsHost();
+
+  if (!saveConfig())
+  {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"falha ao salvar\"}");
+    return;
+  }
+
+  restartAt = millis() + 1000;
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json",
+              "{\"ok\":true,\"restart\":1,\"mdns\":\"" + String(mdns_host) + "\"}");
+}
+#endif // USE_MQTT
 
 // --------------------------------------------------
 // Agendamento diário (ligar/desligar em horário fixo)
@@ -1164,6 +1293,9 @@ void setup()
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
 
+  WiFiManagerParameter p_mdns("mdns", "Nome do aparelho na rede", mdns_host, sizeof(mdns_host));
+
+#ifdef USE_MQTT
   WiFiManagerParameter p_server("server", "Servidor MQTT (opcional)", mqtt_server, sizeof(mqtt_server));
 
   WiFiManagerParameter p_port("port", "Porta MQTT", mqtt_port, sizeof(mqtt_port));
@@ -1174,13 +1306,12 @@ void setup()
 
   WiFiManagerParameter p_topic("topic", "Topico MQTT", mqtt_topic, sizeof(mqtt_topic));
 
-  WiFiManagerParameter p_mdns("mdns", "Nome do aparelho na rede", mdns_host, sizeof(mdns_host));
-
   wm.addParameter(&p_server);
   wm.addParameter(&p_port);
   wm.addParameter(&p_user);
   wm.addParameter(&p_pass);
   wm.addParameter(&p_topic);
+#endif
   wm.addParameter(&p_mdns);
 
   if (!wm.autoConnect(HOST_NAME))
@@ -1190,14 +1321,18 @@ void setup()
     return;
   }
 
+#ifdef USE_MQTT
   strlcpy(mqtt_server, p_server.getValue(), sizeof(mqtt_server));
   strlcpy(mqtt_port, p_port.getValue(), sizeof(mqtt_port));
   strlcpy(mqtt_user, p_user.getValue(), sizeof(mqtt_user));
   strlcpy(mqtt_pass, p_pass.getValue(), sizeof(mqtt_pass));
   strlcpy(mqtt_topic, p_topic.getValue(), sizeof(mqtt_topic));
+#endif
   strlcpy(mdns_host, p_mdns.getValue(), sizeof(mdns_host));
 
+#ifdef USE_MQTT
   normalizeMqttConfig();
+#endif
   normalizeMdnsHost();
 
   if (shouldSaveConfig)
@@ -1205,6 +1340,7 @@ void setup()
     saveConfig();
   }
 
+#ifdef USE_MQTT
   mqttEnabled = hasMqttConfig();
 
   if (mqttEnabled)
@@ -1215,6 +1351,7 @@ void setup()
     mqttClient.setSocketTimeout(3);
     mqttClient.setBufferSize(512);
   }
+#endif
 
   Serial.println();
   Serial.println("Wi-Fi conectado!");
@@ -1225,6 +1362,7 @@ void setup()
   // e servidores NTP.br para o agendamento diário.
   configTzTime("<-03>3", "a.ntp.br", "b.ntp.br", "c.ntp.br");
 
+#ifdef USE_MQTT
   if (mqttEnabled)
   {
     Serial.println("MQTT habilitado.");
@@ -1241,6 +1379,7 @@ void setup()
   {
     Serial.println("MQTT desabilitado.");
   }
+#endif
 
   // Servidor web + mDNS (http://esp01s-rele.local)
   if (MDNS.begin(mdns_host))
@@ -1258,10 +1397,12 @@ void setup()
     Serial.println("OTA: iniciando...");
     restartAt = 0; // não reinicia no meio da gravação
 
+#ifdef USE_MQTT
     if (mqttClient.connected())
     {
       mqttClient.disconnect();
     }
+#endif
 
     otaActive = true; });
 
@@ -1290,8 +1431,12 @@ void setup()
   server.on("/", HTTP_GET, handleIndex);
   server.on("/api/state", HTTP_GET, handleState);
   server.on("/relay", HTTP_GET, handleRelay);
+#ifdef USE_MQTT
   server.on("/api/mqtt", HTTP_GET, handleMqttGet);
   server.on("/api/mqtt", HTTP_POST, handleMqttPost);
+#else
+  server.on("/api/mdns", HTTP_POST, handleMdnsPost);
+#endif
   server.on("/api/schedule", HTTP_GET, handleScheduleGet);
   server.on("/api/schedule", HTTP_POST, handleSchedulePost);
   server.onNotFound(handleNotFound);
@@ -1308,7 +1453,9 @@ void loop()
 
   if (!otaActive)
   {
+#ifdef USE_MQTT
     mqttLoop();
+#endif
 
     // Agendamento diário (ligar/desligar em horário fixo)
     handleSchedule();
@@ -1377,7 +1524,11 @@ void loop()
     Serial.print(" wifi=");
     Serial.print(connected ? "ok" : "down");
     Serial.print(" mqtt=");
+#ifdef USE_MQTT
     Serial.println((mqttEnabled && mqttClient.connected()) ? "ok" : "down");
+#else
+    Serial.println("off");
+#endif
   }
 
   if (connected != wasConnected)
@@ -1401,9 +1552,11 @@ void loop()
         MDNS.update();
       }
 
+#ifdef USE_MQTT
       // Wi-Fi voltou: tenta MQTT imediatamente
       mqttRetry = 0;
       mqttNextAttempt = 0;
+#endif
 
       Serial.print("Wi-Fi reconectado. IP: ");
       Serial.println(WiFi.localIP());

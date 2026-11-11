@@ -1,6 +1,17 @@
 # esp01s-rele SonOff
 
-Firmware para **ESP-01S (1 MB)** que controla um relé via **página web**, **MQTT** e **agendamento diário**, com configuração por **WiFiManager** e atualização por **OTA**.
+Firmware para **ESP-01S (1 MB)** que controla um relé via **página web**, **MQTT (opcional)** e **agendamento diário**, com configuração por **WiFiManager** e atualização por **OTA**.
+
+## Builds (com e sem MQTT)
+
+O MQTT é **opcional em tempo de compilação**: quem não usa o recurso compila o firmware sem ele (código C++ e seção da página web compilados fora — flash e RAM menores, nenhum endpoint MQTT exposto).
+
+| Ambiente | MQTT | Uso |
+| --- | --- | --- |
+| `esp01_1m` (padrão) | ✅ Com MQTT | `pio run -e esp01_1m` |
+| `esp01_1m_nomqtt` | ❌ Sem MQTT | `pio run -e esp01_1m_nomqtt` |
+
+No build padrão a flag `USE_MQTT` é passada via `build_flags` no `platformio.ini`; as opções de placa/upload/libs são compartilhadas no template `[env]`.
 
 ## Hardware
 
@@ -18,35 +29,39 @@ Se o seu módulo de relé for ativo em `HIGH`, comente a linha `#define RELAY_AC
 ## Funcionalidades
 
 ### Controle do relé
-- Liga/desliga por página web, por MQTT e por agendamento.
+- Liga/desliga por página web, por MQTT (build com MQTT) e por agendamento.
 - O estado é persistido em `config.json` no SPIFFS e restaurado no boot.
-- Ao mudar, o novo estado é publicado no MQTT (mensagem retida).
+- No build com MQTT, ao mudar o estado é publicado no MQTT (mensagem retida).
 
 ### Página web (`/`)
 Interface em português, responsiva e em tema escuro, com:
-- Interruptor (switch) para ligar/desligar o relé.
-- Badge de status do MQTT (`MQTT ativo` / `MQTT offline` / `MQTT off`).
+- Cartão do relé com interruptor (switch) e rótulo `LIGADO`/`DESLIGADO`.
+- Badge de status do MQTT (`MQTT ativo` / `MQTT offline` / `MQTT off`) — apenas no build com MQTT.
 - Exibição do endereço de acesso (hostname) e do relógio do aparelho.
+- Rodapé com uptime, heap livre e RSSI do Wi-Fi.
+- `SEM CONEXAO` aparece no próprio rótulo do cartão quando a página perde contato com o aparelho.
 - Sincronização automática do estado a cada 2 segundos.
-- Seções expansíveis de **Configuração**, **Automação** e **MQTT**.
+- Seções expansíveis de **Configuração**, **Automação** e, no build com MQTT, **MQTT**.
 
 ### Servidor web + API
 | Rota | Método | Descrição |
 | --- | --- | --- |
 | `/` | GET | Página de controle |
-| `/api/state` | GET | Estado do relé, do MQTT e do relógio |
+| `/api/state` | GET | Estado do relé, MQTT (build com MQTT), relógio, uptime, heap, RSSI e mDNS |
 | `/relay` | GET | Controla o relé (`?state=on\|off\|toggle`) |
-| `/api/mqtt` | GET | Lê a configuração de MQTT e mDNS |
-| `/api/mqtt` | POST | Salva a configuração (reinicia o aparelho) |
+| `/api/mqtt` | GET/POST | Configuração de MQTT e mDNS (build **com** MQTT; o POST reinicia o aparelho) |
+| `/api/mdns` | POST | Salva o nome mDNS (build **sem** MQTT; reinicia o aparelho) |
 | `/api/schedule` | GET | Lê os agendamentos |
 | `/api/schedule` | POST | Salva os agendamentos |
 
 Resposta de `/api/state`:
 ```json
-{ "relay": "on", "gpio": 0, "mqtt": true, "mqtt_connected": true, "time_synced": true, "clock": "08:30:00" }
+{ "relay": "on", "gpio": 0, "mqtt": true, "mqtt_connected": true, "time_synced": true, "clock": "08:30:00", "uptime": 3600, "heap": 38896, "rssi": -66, "mdns": "esp01s-rele" }
 ```
 
-### MQTT
+> No build **sem** MQTT os campos `mqtt`/`mqtt_connected` não existem no JSON.
+
+### MQTT *(build com MQTT)*
 - **Habilitado** apenas quando há um servidor e uma porta válida (1–65535).
 - **Tópico base** configurável (padrão `iot/leds/output`), com barra final removida automaticamente.
 - Publica o estado no tópico base (**retido**) e assina os comandos em `iot/leds/input`.
@@ -70,7 +85,7 @@ Payload publicado no tópico base:
 
 O campo `collection` corresponde ao nome do **"banco de dados" do Mongo** (no ESP-01S, definido como `iluminacao`). Ele pode ser tratado no **Node-RED** para direcionar o documento à coleção correta antes de gravar no MongoDB.
 
-### Integração com Node-RED
+### Integração com Node-RED *(build com MQTT)*
 O MQTT pode rodar **dentro do próprio Node-RED** com o nó **`node-red-contrib-aedes`**, sem instalar nada além do Node-RED (dispensa um broker externo como Mosquitto).
 
 No fluxo, o payload do ESP-01S é normalizado por uma **Function** e enviado ao MongoDB pelo nó **`node-red-contrib-mongodb4`**:
@@ -149,23 +164,37 @@ Fluxo resumido: **broker Aedes (Node-RED) → nó MQTT → Function (acima) → 
 - Nada acontece enquanto o NTP não sincroniza.
 
 ### Configuração e persistência
-- `config.json` (SPIFFS) guarda: MQTT (servidor, porta, usuário, senha, tópico), hostname mDNS, estado do relé e agendamentos.
+- `config.json` (SPIFFS) guarda: hostname mDNS, estado do relé e agendamentos — e, no build com MQTT, servidor/porta/usuário/senha/tópico MQTT. (Campos MQTT de um config antigo são ignorados pelo build sem MQTT.)
 - Normalizações automáticas: porta padrão `1883` quando há servidor sem porta, tópico padrão quando vazio, horários inválidos voltam para `06:00`/`22:00`, e o nome mDNS é truncado em 31 caracteres e limitado a `[A-Za-z0-9-_.]` (com remoção do sufixo `.local`).
 - Salvar a configuração pela página **reinicia o aparelho** para aplicar tudo.
 - Na página, deixar o campo de senha vazio **mantém a senha atual**.
 
 ### WiFiManager (primeiro uso)
 - `autoConnect` com o AP `ESP01S-RELE` quando não há rede salva.
-- Parâmetros do portal: servidor MQTT, porta, usuário, senha, tópico e nome do aparelho na rede.
+- Parâmetros do portal: nome do aparelho na rede — e, no build com MQTT, servidor MQTT, porta, usuário, senha e tópico.
 - Configuração salva é relida e normalizada após a conexão.
+
+### Resiliência de Wi-Fi e diagnóstico
+- **Modem sleep desativado** (`WIFI_NONE_SLEEP`) em todos os cenários — evita quedas por *beacon timeout* com roteadores sensíveis.
+- **Reconexão ativa com fallback** (o auto-reconnect do core pode falhar silenciosamente):
+  | Tempo sem rede | Ação |
+  | --- | --- |
+  | 0–5 min | Apenas observa (tolera queda proposital, ex. manutenção do roteador) |
+  | ≥ 5 min | `WiFi.reconnect()` a cada 5 minutos |
+  | ≥ 8 h | Reinicia o aparelho (relé volta com o estado salvo; agendamento segue pelo relógio interno) |
+- **Diagnóstico integrado** para identificar a causa de quedas e travamentos:
+  - No boot, imprime o motivo do último reset (`ESP.getResetReason()` — distingue crash/soft WDT/brownout de um reboot normal).
+  - Na desconexão, loga o **reason code** do core (ex. `BEACON_TIMEOUT`, `NO_AP_FOUND`); na reconexão, IP e RSSI.
+  - A cada 60 s, log no serial: uptime, heap livre, RSSI e status Wi-Fi/MQTT (heap caindo ao longo de horas indica fragmentação).
+- Ao voltar a rede: mDNS refeito (com fallback para `esp01s-rele`), backoff do MQTT zerado e reconexão imediata.
 
 ### OTA e rede
 - **OTA via rede** (PlatformIO: `upload_protocol = espota`), com o hostname do OTA igual ao do mDNS.
-- Durante o OTA o MQTT é desconectado, os reinícios agendados são cancelados e o loop de MQTT/agendamento é pausado.
+- Durante o OTA os reinícios agendados são cancelados, o loop de MQTT/agendamento é pausado e (no build com MQTT) o cliente MQTT é desconectado.
 - Progresso do OTA exibido no serial a cada 10%.
 - mDNS reiniciado automaticamente quando o Wi-Fi volta, com fallback para `esp01s-rele` se o hostname normalizado falhar.
-- Logs no serial (115200 baud) de queda/restauração do Wi-Fi, IP, estado do relé e mensagens MQTT.
+- Logs no serial (115200 baud): estado do relé, mensagens MQTT (build com MQTT) e os diagnósticos da seção acima.
 
 ## Bibliotecas utilizadas
 
-`ESP8266WiFi`, `FS (SPIFFS)`, `WiFiManager`, `ArduinoJson`, `ESP8266WebServer`, `ESP8266mDNS`, `PubSubClient`, `ArduinoOTA` e `coredecls`.
+`ESP8266WiFi`, `FS (SPIFFS)`, `WiFiManager`, `ArduinoJson`, `ESP8266WebServer`, `ESP8266mDNS`, `ArduinoOTA` e `coredecls` — além de `PubSubClient` no build com MQTT.
