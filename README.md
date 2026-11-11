@@ -6,12 +6,22 @@ Firmware para **ESP-01S (1 MB)** que controla um relé via **página web**, **MQ
 
 O MQTT é **opcional em tempo de compilação**: quem não usa o recurso compila o firmware sem ele (código C++ e seção da página web compilados fora — flash e RAM menores, nenhum endpoint MQTT exposto).
 
-| Ambiente | MQTT | Uso |
-| --- | --- | --- |
-| `esp01_1m` (padrão) | ✅ Com MQTT | `pio run -e esp01_1m` |
-| `esp01_1m_nomqtt` | ❌ Sem MQTT | `pio run -e esp01_1m_nomqtt` |
+O projeto tem **um único ambiente** (`esp01_1m`). O MQTT é controlado pela flag `USE_MQTT` no `platformio.ini`:
 
-No build padrão a flag `USE_MQTT` é passada via `build_flags` no `platformio.ini`; as opções de placa/upload/libs são compartilhadas no template `[env]`.
+```ini
+; COM MQTT (padrão do repositório):
+build_flags = -DUSE_MQTT
+
+; SEM MQTT: comente a linha acima
+; build_flags = -DUSE_MQTT
+```
+
+| Estado da flag | Flash | RAM |
+| --- | --- | --- |
+| Ativa (com MQTT) | ~461 KB (48,2%) | 41,9% |
+| Comentada (sem MQTT) | ~451 KB (47,0%) | 40,7% |
+
+Compile com `pio run` (ou pelo botão do PlatformIO) após ajustar a flag.
 
 ## Hardware
 
@@ -35,11 +45,12 @@ Se o seu módulo de relé for ativo em `HIGH`, comente a linha `#define RELAY_AC
 
 ### Página web (`/`)
 Interface em português, responsiva e em tema escuro, com:
-- Cartão do relé com interruptor (switch) e rótulo `LIGADO`/`DESLIGADO`.
+- Cartão do relé com interruptor (switch) e rótulo `LIGADO`/`DESLIGADO` — o rótulo mostra apenas o estado do relé.
+- Label de aviso na linha do hostname, à direita, exibida só quando necessário: `Sincronizando...` enquanto o toggle aguarda o backend (o interruptor fica desabilitado até a resposta) e `SEM CONEXAO` quando a página perde contato com o aparelho.
 - Badge de status do MQTT (`MQTT ativo` / `MQTT offline` / `MQTT off`) — apenas no build com MQTT.
 - Exibição do endereço de acesso (hostname) e do relógio do aparelho.
 - Rodapé com uptime, heap livre e RSSI do Wi-Fi.
-- `SEM CONEXAO` aparece no próprio rótulo do cartão quando a página perde contato com o aparelho.
+- `SEM CONEXAO` aparece na label de aviso (linha do hostname) quando a página perde contato com o aparelho; o cartão mantém o último estado conhecido e a label some no primeiro sync bem-sucedido.
 - Sincronização automática do estado a cada 2 segundos.
 - Seções expansíveis de **Configuração**, **Automação** e, no build com MQTT, **MQTT**.
 
@@ -197,12 +208,12 @@ Para recuperação do aparelho (ex.: perdido na rede com nome/IP que não lembra
   ```
 - **Sem o `#define` (padrão do repositório), o endpoint nem é registrado** — toda tentativa responde 404, como qualquer rota inexistente.
 - Uso: acesse no navegador `http://<ip>/reset/p=<senha>`.
-  - **Senha correta:** apaga `config.json` (MQTT, mDNS, agendamentos, estado do relé), apaga as credenciais Wi-Fi (`WiFi.eraseConfig`) e reinicia — no boot, o WiFiManager abre o AP `ESP01S-RELE` para configurar do zero. Resposta: `{"ok":true,"restart":1}`.
+  - **Senha correta:** apaga `config.json` (MQTT, mDNS, agendamentos, estado do relé), apaga as credenciais Wi-Fi (`ESP.eraseConfig()`) e reinicia — no boot, o WiFiManager abre o AP `ESP01S-RELE` para configurar do zero. Resposta: `{"ok":true,"restart":1}`.
   - **Senha errada:** responde 404 com 1 segundo de atraso (dificulta força bruta), sem revelar que a rota existe.
 - Funciona nos dois builds (com e sem MQTT). Vale apenas na rede local, via HTTP — use para recuperação, não como mecanismo remoto de administração.
 
 ### OTA e rede
-- **OTA via rede** (PlatformIO: `upload_protocol = espota`), com o hostname do OTA igual ao do mDNS.
+- **OTA via rede** (PlatformIO: `upload_protocol = espota` + `upload_port` apontando para o IP do aparelho ou `esp01s-rele.local`), com o hostname do OTA igual ao do mDNS. Para upload por USB, comente essas duas linhas que o PlatformIO detecta a porta serial automaticamente.
 - Durante o OTA os reinícios agendados são cancelados, o loop de MQTT/agendamento é pausado e (no build com MQTT) o cliente MQTT é desconectado.
 - Progresso do OTA exibido no serial a cada 10%.
 - mDNS reiniciado automaticamente quando o Wi-Fi volta, com fallback para `esp01s-rele` se o hostname normalizado falhar.
