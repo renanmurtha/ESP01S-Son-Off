@@ -180,19 +180,23 @@ Fluxo resumido: **broker Aedes (Node-RED) → nó MQTT → Function (acima) → 
 - Salvar a configuração pela página **reinicia o aparelho** para aplicar tudo.
 - Na página, deixar o campo de senha vazio **mantém a senha atual**.
 
-### WiFiManager (primeiro uso)
-- `autoConnect` com o AP `ESP01S-RELE` quando não há rede salva.
+### WiFiManager
+- Sem credenciais salvas (primeiro uso): `autoConnect` abre o AP `ESP01S-RELE` normalmente.
+- Com credenciais salvas: o boot tenta conectar por até **60 s** e, sem sucesso, **não abre o portal** — segue para o loop, onde a política de reconexão assume (portal só depois de 8 h offline).
 - Parâmetros do portal: nome do aparelho na rede — e, no build com MQTT, servidor MQTT, porta, usuário, senha e tópico.
-- Configuração salva é relida e normalizada após a conexão.
+- Configuração salva é relida e normalizada após a conexão (vale para o portal do boot e para o portal de 8 h).
 
 ### Resiliência de Wi-Fi e diagnóstico
 - **Modem sleep desativado** (`WIFI_NONE_SLEEP`) em todos os cenários — evita quedas por *beacon timeout* com roteadores sensíveis.
-- **Reconexão ativa com fallback** (o auto-reconnect do core pode falhar silenciosamente):
+- **Reconexão ativa com fallback** (o auto-reconnect do core pode falhar silenciosamente). Queda de rede nunca abre o configurador — nem no boot, nem durante o ciclo:
   | Tempo sem rede | Ação |
   | --- | --- |
-  | 0–5 min | Apenas observa (tolera queda proposital, ex. manutenção do roteador) |
-  | ≥ 5 min | `WiFi.reconnect()` a cada 5 minutos |
-  | ≥ 8 h | Reinicia o aparelho (relé volta com o estado salvo; agendamento segue pelo relógio interno) |
+  | Boot | Tenta conectar por até 60 s; falhou, segue offline para o loop |
+  | 0–30 s | Apenas observa (tolera queda proposital, ex. manutenção do roteador) |
+  | ≥ 30 s | Primeira tentativa de `WiFi.reconnect()`, depois a cada 5 minutos |
+  | ≥ 8 h | Abre o portal do WiFiManager por até 5 min (cobre senha errada / rede removida) |
+
+  No portal de 8 h: se houver configuração salva, o aparelho grava no SPIFFS e reinicia; fechou sem conectar (ou sem ninguém no AP), recomeça o ciclo de reconexão e o portal reabre a cada novo ciclo de 8 h.
 - **Diagnóstico integrado** para identificar a causa de quedas e travamentos:
   - No boot, imprime o motivo do último reset (`ESP.getResetReason()` — distingue crash/soft WDT/brownout de um reboot normal).
   - Na desconexão, loga o **reason code** do core (ex. `BEACON_TIMEOUT`, `NO_AP_FOUND`); na reconexão, IP e RSSI.
