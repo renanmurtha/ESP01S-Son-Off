@@ -40,6 +40,12 @@
 /* hostname para MDNS.begin, sem .local */
 #define MDNS_HOST "esp01s-rele"
 
+// Re-anúncio mDNS periódico (anúncio não-solicitado, RFC 6762 §8.3):
+// o core do LEAmDNS só anuncia no begin() e o registro A do host tem
+// TTL de 120 s no cache dos clientes (LEAmDNS_Priv.h). Renova os
+// caches a cada 90 s, antes de expirar.
+#define MDNS_ANNOUNCE_EVERY 90000UL
+
 /* JSON config names (usados apenas no payload MQTT) */
 #ifdef USE_MQTT
 #define SENSOR_NAME "Iluminação"
@@ -1360,6 +1366,21 @@ void setup()
     Serial.println("Falha ao montar SPIFFS.");
   }
 
+  // Sincroniza os parâmetros do portal com a config carregada.
+  // Os parâmetros são globais e copiam o valor na INICIALIZAÇÃO do
+  // programa (antes do loadConfig) - sem isto, o buffer deles nasce
+  // em branco e a leitura de volta (lePortalParams) apagaria a
+  // configuração salva do usuário a cada boot.
+  p_mdns.setValue(mdns_host, sizeof(mdns_host));
+
+#ifdef USE_MQTT
+  p_server.setValue(mqtt_server, sizeof(mqtt_server));
+  p_port.setValue(mqtt_port, sizeof(mqtt_port));
+  p_user.setValue(mqtt_user, sizeof(mqtt_user));
+  p_pass.setValue(mqtt_pass, sizeof(mqtt_pass));
+  p_topic.setValue(mqtt_topic, sizeof(mqtt_topic));
+#endif
+
   // digitalWrite(RELAY_PIN, relayState ? RELAY_ON : RELAY_OFF);
   // pinMode(RELAY_PIN, OUTPUT);
 
@@ -1422,16 +1443,14 @@ void setup()
 
   bool wifiOk = wm.autoConnect(HOST_NAME);
 
-  // Lê os valores digitados no portal (vale também para o portal de 8 h)
-  lePortalParams();
-
-#ifdef USE_MQTT
-  normalizeMqttConfig();
-#endif
-  normalizeMdnsHost();
-
+  // Lê os valores digitados no portal APENAS se o portal foi usado
+  // (shouldSaveConfig só fica true quando o formulário é enviado).
+  // Boot limpo, que conectou direto, não pode tocar na config
+  // carregada do SPIFFS.
   if (shouldSaveConfig)
   {
+    lePortalParams();
+
     saveConfig();
     shouldSaveConfig = false;
   }
@@ -1553,6 +1572,17 @@ void loop()
   ArduinoOTA.handle();
   server.handleClient();
   MDNS.update();
+
+  // Re-anúncio mDNS (a cada 90 s com Wi-Fi no ar): mesmo mecanismo do
+  // begin(), um pacote multicast ~200 bytes; renova os caches dos
+  // clientes antes do TTL de 120 s vencer. Condição única: Wi-Fi.
+  static uint32_t mdnsLastAnnounce = 0;
+  if (WiFi.status() == WL_CONNECTED &&
+      (uint32_t)(millis() - mdnsLastAnnounce) >= MDNS_ANNOUNCE_EVERY)
+  {
+    mdnsLastAnnounce = millis();
+    MDNS.announce();
+  }
 
   if (!otaActive)
   {
