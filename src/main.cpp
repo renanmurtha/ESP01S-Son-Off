@@ -70,6 +70,18 @@ bool mqttEnabled = false;
 // Estado atual do relé (espelhado na página web)
 bool relayState = false;
 
+// WiFiManager global: o portal também é aberto no loop() após 8 h offline
+WiFiManager wm;
+
+#ifdef USE_MQTT
+WiFiManagerParameter p_server("server", "Servidor MQTT (opcional)", mqtt_server, sizeof(mqtt_server));
+WiFiManagerParameter p_port("port", "Porta MQTT", mqtt_port, sizeof(mqtt_port));
+WiFiManagerParameter p_user("user", "Usuario MQTT (opcional)", mqtt_user, sizeof(mqtt_user));
+WiFiManagerParameter p_pass("pass", "Senha MQTT (opcional)", mqtt_pass, sizeof(mqtt_pass));
+WiFiManagerParameter p_topic("topic", "Topico MQTT", mqtt_topic, sizeof(mqtt_topic));
+#endif
+WiFiManagerParameter p_mdns("mdns", "Nome do aparelho na rede", mdns_host, sizeof(mdns_host));
+
 // Agendamento diário (fuso fixo BRT, UTC-3, horários no formato "HH:MM")
 char schedOn[6] = "06:00";
 char schedOff[6] = "22:00";
@@ -100,10 +112,14 @@ uint8_t mqttRetry = 0;
 #endif
 
 // Reconexão ativa de Wi-Fi (o auto-reconnect do core pode falhar)
-// Política: 5 min sem rede -> WiFi.reconnect() a cada 5 min (gentil,
-// tolera queda proposital por manutenção); 8 h sem rede -> reinicia.
+// Política: no boot, tenta conectar por até 60 s SEM abrir o portal.
+// Depois, no loop: 5 min sem rede -> WiFi.reconnect() a cada 5 min;
+// 8 h contínuas sem rede -> abre o configurador por no máximo 5 min
+// (cobertura para senha errada / rede removida); sem sucesso, recomeça.
 #define WIFI_RECONNECT_AFTER 300000UL   // 5 min
-#define WIFI_RESTART_AFTER 28800000UL   // 8 h
+#define WIFI_FIRST_RETRY 30000UL        // primeira tentativa após queda/boot offline
+#define WIFI_PORTAL_AFTER 28800000UL    // 8 h
+#define WIFI_PORTAL_TIMEOUT 300UL       // configurador aberto por até 5 min
 uint32_t wifiDownSince = 0;             // 0 = Wi-Fi conectado
 uint32_t wifiLastReconnect = 0;
 uint32_t wifiNextStats = 0;             // próximo log de status (60 s)
@@ -174,6 +190,27 @@ void normalizeMdnsHost()
   }
 
   strlcpy(mdns_host, h.c_str(), sizeof(mdns_host));
+}
+
+// --------------------------------------------------
+// Lê os parâmetros digitados no portal do WiFiManager
+// e normaliza (usado no setup e após o portal de 8 h)
+// --------------------------------------------------
+void lePortalParams()
+{
+#ifdef USE_MQTT
+  strlcpy(mqtt_server, p_server.getValue(), sizeof(mqtt_server));
+  strlcpy(mqtt_port, p_port.getValue(), sizeof(mqtt_port));
+  strlcpy(mqtt_user, p_user.getValue(), sizeof(mqtt_user));
+  strlcpy(mqtt_pass, p_pass.getValue(), sizeof(mqtt_pass));
+  strlcpy(mqtt_topic, p_topic.getValue(), sizeof(mqtt_topic));
+#endif
+  strlcpy(mdns_host, p_mdns.getValue(), sizeof(mdns_host));
+
+#ifdef USE_MQTT
+  normalizeMqttConfig();
+#endif
+  normalizeMdnsHost();
 }
 
 // --------------------------------------------------
@@ -1359,45 +1396,34 @@ void setup()
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm"); });
 
-  WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
 
-  WiFiManagerParameter p_mdns("mdns", "Nome do aparelho na rede", mdns_host, sizeof(mdns_host));
+  // Política de boot: nunca abrir o configurador por queda de rede.
+  // Há credenciais salvas: tenta conectar por até 60 s e, sem sucesso,
+  // segue para o loop(), que reconecta a cada 5 min e só abre o portal
+  // após 8 h contínuas offline. Sem credenciais (primeira configuração),
+  // o portal abre normalmente.
+  wm.setConnectTimeout(60000);
+
+  if (WiFi.SSID().length() > 0)
+  {
+    wm.setEnableConfigPortal(false);
+  }
+
+  wm.addParameter(&p_mdns);
 
 #ifdef USE_MQTT
-  WiFiManagerParameter p_server("server", "Servidor MQTT (opcional)", mqtt_server, sizeof(mqtt_server));
-
-  WiFiManagerParameter p_port("port", "Porta MQTT", mqtt_port, sizeof(mqtt_port));
-
-  WiFiManagerParameter p_user("user", "Usuario MQTT (opcional)", mqtt_user, sizeof(mqtt_user));
-
-  WiFiManagerParameter p_pass("pass", "Senha MQTT (opcional)", mqtt_pass, sizeof(mqtt_pass));
-
-  WiFiManagerParameter p_topic("topic", "Topico MQTT", mqtt_topic, sizeof(mqtt_topic));
-
   wm.addParameter(&p_server);
   wm.addParameter(&p_port);
   wm.addParameter(&p_user);
   wm.addParameter(&p_pass);
   wm.addParameter(&p_topic);
 #endif
-  wm.addParameter(&p_mdns);
 
-  if (!wm.autoConnect(HOST_NAME))
-  {
-    delay(1000);
-    ESP.restart();
-    return;
-  }
+  bool wifiOk = wm.autoConnect(HOST_NAME);
 
-#ifdef USE_MQTT
-  strlcpy(mqtt_server, p_server.getValue(), sizeof(mqtt_server));
-  strlcpy(mqtt_port, p_port.getValue(), sizeof(mqtt_port));
-  strlcpy(mqtt_user, p_user.getValue(), sizeof(mqtt_user));
-  strlcpy(mqtt_pass, p_pass.getValue(), sizeof(mqtt_pass));
-  strlcpy(mqtt_topic, p_topic.getValue(), sizeof(mqtt_topic));
-#endif
-  strlcpy(mdns_host, p_mdns.getValue(), sizeof(mdns_host));
+  // Lê os valores digitados no portal (vale também para o portal de 8 h)
+  lePortalParams();
 
 #ifdef USE_MQTT
   normalizeMqttConfig();
@@ -1407,6 +1433,7 @@ void setup()
   if (shouldSaveConfig)
   {
     saveConfig();
+    shouldSaveConfig = false;
   }
 
 #ifdef USE_MQTT
@@ -1423,9 +1450,16 @@ void setup()
 #endif
 
   Serial.println();
-  Serial.println("Wi-Fi conectado!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  if (wifiOk)
+  {
+    Serial.println("Wi-Fi conectado!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println("Wi-Fi offline no boot, reconectando em segundo plano...");
+  }
 
   // Relógio do sistema: fuso fixo BRT (UTC-3, sem horário de verão)
   // e servidores NTP.br para o agendamento diário.
@@ -1553,17 +1587,42 @@ void loop()
     if (wifiDownSince == 0)
     {
       wifiDownSince = agoraMs;
-      wifiLastReconnect = agoraMs;
+      // primeira tentativa de reconexão em 30 s, depois a cada 5 min
+      wifiLastReconnect = agoraMs - (WIFI_RECONNECT_AFTER - WIFI_FIRST_RETRY);
     }
 
-    // 8 h sem rede: reinicia (o relé volta com o estado salvo no SPIFFS
-    // e o agendamento continua pelo relógio interno; com a rede fora,
-    // ex. manutenção longa, o reboot não afeta a automação)
-    if ((uint32_t)(agoraMs - wifiDownSince) >= WIFI_RESTART_AFTER)
+    // 8 h sem rede: abre o configurador por até 5 min (cobre senha
+    // errada / rede removida). Fechou sem conectar, volta a reconectar
+    // e o ciclo se repete a cada 8 h.
+    if ((uint32_t)(agoraMs - wifiDownSince) >= WIFI_PORTAL_AFTER)
     {
-      Serial.println("Wi-Fi offline ha 8h, reiniciando...");
-      delay(100);
-      ESP.restart();
+      Serial.println("Wi-Fi offline ha 8h, abrindo configurador (max 5 min)...");
+      wifiDownSince = 0; // recomeça o ciclo (se conectar, permanece 0)
+
+      wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT);
+      wm.startConfigPortal(HOST_NAME);
+
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        Serial.print("Conectado via configurador. IP: ");
+        Serial.println(WiFi.localIP());
+      }
+      else
+      {
+        Serial.println("Configurador fechou sem conectar, voltando a reconectar...");
+      }
+
+      if (shouldSaveConfig)
+      {
+        shouldSaveConfig = false;
+        lePortalParams();
+        saveConfig();
+        Serial.println("Configuracao salva pelo portal, reiniciando...");
+        delay(100);
+        ESP.restart();
+        return;
+      }
+
       return;
     }
 
