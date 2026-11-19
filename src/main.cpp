@@ -102,6 +102,11 @@ int schedOffYear = -1, schedOffYday = -1;
 // Reinício agendado (0 = sem reinício pendente)
 uint32_t restartAt = 0;
 
+// Uptime à prova de overflow: millis() é 32 bits e estoura em ~49,7 dias.
+// Guarda os segundos acumulados antes do último wrap.
+uint32_t uptimeBase = 0;
+uint32_t uptimeLastMs = 0;
+
 // OTA em andamento (pausa o loop do MQTT durante a gravação)
 bool otaActive = false;
 
@@ -115,6 +120,11 @@ PubSubClient mqttClient(netClient);
 // Backoff de reconexão MQTT (não-bloqueante)
 uint32_t mqttNextAttempt = 0;
 uint8_t mqttRetry = 0;
+
+// Status pendente de envio ao broker (-1 = nada, 0 = OFF, 1 = ON).
+// Coalescido e só em RAM: se o MQTT cair, o próximo ciclo entrega o
+// estado atual; se reiniciar antes, perde só a entrega (o relé, não).
+int8_t mqttPending = -1;
 #endif
 
 // Reconexão ativa de Wi-Fi (o auto-reconnect do core pode falhar)
@@ -129,6 +139,9 @@ uint8_t mqttRetry = 0;
 uint32_t wifiDownSince = 0;             // 0 = Wi-Fi conectado
 uint32_t wifiLastReconnect = 0;
 uint32_t wifiNextStats = 0;             // próximo log de status (60 s)
+uint8_t  wifiLastReason = 0;            // motivo do último disconnect (0 = nenhum)
+uint32_t wifiLastReasonAt = 0;          // millis() da última queda
+uint16_t wifiDrops = 0;                 // quedas de Wi-Fi desde o boot
 
 // --------------------------------------------------
 // Callback do WiFiManager
@@ -409,9 +422,10 @@ String mqttTopic(const char *suffix)
 }
 
 // --------------------------------------------------
-// Monta o JSON enviado ao broker
+// Monta o JSON de status enviado ao broker.
+// Presença (online/offline) é sessão e fica só na página.
 // --------------------------------------------------
-String buildMqttJson(const char *availability, bool state)
+String buildStateJson(bool state)
 {
   StaticJsonDocument<512> json;
 
@@ -422,7 +436,6 @@ String buildMqttJson(const char *availability, bool state)
   json["chipId"] = CHIP_ID;
 
   JsonObject mensagem = json.createNestedObject("message");
-  mensagem["availability"] = availability;
   mensagem["state"] = state ? "ON" : "OFF";
 
   String out;
@@ -431,22 +444,30 @@ String buildMqttJson(const char *availability, bool state)
 }
 
 // --------------------------------------------------
-// Publica o estado do relé (retido)
+// Entrega ao broker o status pendente (retido).
+// Único ponto de envio: só há payload quando o relé mudou.
+// Sem conexão (ou sem MQTT), fica pendente até o próximo ciclo.
 // --------------------------------------------------
-void publishRelayState()
+bool mqttFlush()
 {
-  if (!mqttClient.connected())
+  if (!mqttEnabled || mqttPending < 0 || !mqttClient.connected())
   {
-    return;
+    return false;
   }
 
-  String payload = buildMqttJson("online", relayState);
+  String payload = buildStateJson(mqttPending == 1);
 
-  if (mqttClient.publish(mqtt_topic, payload.c_str(), true))
+  if (!mqttClient.publish(mqttTopic("").c_str(), payload.c_str(), true))
   {
-    Serial.print("MQTT -> ");
-    Serial.println(payload);
+    return false; // continua pendente; tenta no próximo loop
   }
+
+  mqttPending = -1;
+
+  Serial.print("MQTT -> ");
+  Serial.println(payload);
+
+  return true;
 }
 #endif // USE_MQTT
 
@@ -471,7 +492,8 @@ void setRelay(bool on, bool persist = true)
   if (changed)
   {
 #ifdef USE_MQTT
-    publishRelayState();
+    mqttPending = on ? 1 : 0;
+    mqttFlush();
 #endif
   }
 }
@@ -641,22 +663,21 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 }
 
 // --------------------------------------------------
-// Conexão MQTT com LWT (availability)
+// Conexão MQTT (sem LWT: presença é sessão, não status)
 // --------------------------------------------------
 bool mqttConnect()
 {
   String clientId = String(HOST_NAME) + "-" + String(ESP.getChipId());
-  String willPayload = buildMqttJson("offline", relayState);
 
   bool ok;
 
   if (strlen(mqtt_user) > 0)
   {
-    ok = mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass, mqtt_topic, 0, true, willPayload.c_str());
+    ok = mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass);
   }
   else
   {
-    ok = mqttClient.connect(clientId.c_str(), mqtt_topic, 0, true, willPayload.c_str());
+    ok = mqttClient.connect(clientId.c_str());
   }
 
   if (!ok)
@@ -665,9 +686,6 @@ bool mqttConnect()
     Serial.println(mqttClient.state());
     return false;
   }
-
-  // Estado atual (retido)
-  mqttClient.publish(mqtt_topic, buildMqttJson("online", relayState).c_str(), true);
 
   mqttClient.subscribe(MQTT_INPUT_TOPIC);
 
@@ -694,6 +712,7 @@ void mqttLoop()
   if (mqttClient.connected())
   {
     mqttClient.loop();
+    mqttFlush();
     return;
   }
 
@@ -718,6 +737,7 @@ void mqttLoop()
   if (mqttConnect())
   {
     mqttRetry = 0;
+    mqttFlush(); // entrega o status que ficou pendente durante a queda
     return;
   }
 
@@ -751,10 +771,14 @@ font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
 padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
 .top{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
 h1{margin:0;font-size:clamp(15px,4.5vw,18px);font-weight:600;letter-spacing:.4px}
+.badges{display:flex;gap:6px}
 .badge{font-size:11px;padding:2px 8px;border-radius:10px;background:#232833;color:#8a91a0}
 .badge.on{background:rgba(34,197,94,.16);color:var(--on)}
-.ip{margin:4px 0 14px;display:flex;justify-content:space-between;align-items:baseline;
-font-size:clamp(11px,3vw,13px);color:#8a91a0;word-break:break-all}
+.badge.err{background:rgba(248,113,113,.16);color:#f87171}
+.ip{margin:4px 0 14px;display:flex;justify-content:space-between;align-items:baseline;gap:8px;
+height:18px;line-height:18px;overflow:hidden;white-space:nowrap;
+font-size:clamp(11px,3vw,13px);color:#8a91a0}
+#ip{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row{display:flex;align-items:center;justify-content:space-between;gap:12px;
 background:#12151c;border:1px solid #262b36;border-radius:12px;padding:14px}
 .row .lbl{font-size:15px;font-weight:600}
@@ -766,7 +790,7 @@ background:#fff;transition:.2s}
 .sw input:checked+.track{background:var(--on);box-shadow:0 0 16px rgba(34,197,94,.45)}
 .sw input:checked+.track:before{transform:translateX(28px)}
 input:disabled+.track{opacity:.6}
-.aviso{display:none;font-size:11px;font-weight:600;color:#f87171}
+.aviso{display:none;white-space:nowrap;font-size:11px;font-weight:600;color:#f87171}
 .aviso.on{display:block}
 details{margin-top:14px;border-top:1px solid #262b36;padding-top:12px}
 summary{cursor:pointer;font-size:14px;font-weight:600;color:#8a91a0;list-style:none}
@@ -787,34 +811,24 @@ background:var(--blue);color:#fff;font-size:15px;font-weight:600}
 button:active{opacity:.85}
 .msg{margin-top:8px;text-align:center;font-size:13px;min-height:18px;color:var(--on)}
 .hint{margin-top:14px;text-align:center;font-size:11px;color:#5c6470}
+#ftr{border-top:1px solid #262b36;margin-top:16px;padding-top:10px}
 </style>
 </head>
 <body>
 <div class="card">
-<div class="top"><h1>ESP01S &middot; Rele</h1>
+<div class="top"><h1>ESP01S &middot; Rele</h1><span class="badges">
+<span class="badge" id="nb" title="Rede">Rede</span>
 )HTML"
 #ifdef USE_MQTT
-  R"HTML(<span class="badge" id="mb">MQTT</span>)HTML"
+  R"HTML(<span class="badge" id="mb" title="MQTT" hidden>MQTT</span>)HTML"
 #endif
-  R"HTML(</div>
+  R"HTML(</span></div>
 <p class="ip"><span id="ip"></span><span class="aviso" id="aviso"></span></p>
 <div class="row">
 <span class="lbl" id="lb">...</span>
 <label class="sw"><input type="checkbox" id="sw" onchange="tgl(this.checked)"><span class="track"></span></label>
 </div>
 )HTML"
-#ifdef USE_MQTT
-  R"HTML(<details>
-<summary>Configuracao</summary>
-<form onsubmit="return saveMqtt(event)">
-<label for="f6">URL (DNS)</label>
-<input id="f6" name="mdns" autocomplete="off">
-<button type="submit" id="sb">Salvar</button>
-<div class="msg" id="msg"></div>
-</form>
-</details>
-)HTML"
-#else
   R"HTML(<details>
 <summary>Configuracao</summary>
 <form onsubmit="return saveMdns(event)">
@@ -825,7 +839,6 @@ button:active{opacity:.85}
 </form>
 </details>
 )HTML"
-#endif
   R"HTML(<details>
 <summary>Automacao</summary>
 <form onsubmit="return saveSched(event)">
@@ -859,7 +872,7 @@ button:active{opacity:.85}
 </details>
 )HTML"
 #endif
-  R"HTML(<div class="hint" id="ftr">Estado sincronizado a cada 2s</div>
+  R"HTML(<div class="hint" id="ftr">Ligado ha --</div>
 </div>
 <script>
 var sw=document.getElementById('sw'),
@@ -868,44 +881,97 @@ c1=document.getElementById('c1'),f7=document.getElementById('f7'),
 c2=document.getElementById('c2'),f8=document.getElementById('f8'),
 sb2=document.getElementById('sb2'),msg2=document.getElementById('msg2'),
 clk=document.getElementById('clk'),ftr=document.getElementById('ftr'),
-aviso=document.getElementById('aviso');
+aviso=document.getElementById('aviso'),nb=document.getElementById('nb');
 )HTML"
 #ifdef USE_MQTT
   R"HTML(var mb=document.getElementById('mb');
 )HTML"
 #endif
   R"HTML(document.getElementById('ip').textContent=location.hostname;
-var emAcao=false;
+var emAcao=false,ultimoOn=false,offline=false,emSync=false,falhas=0,syncSeq=0;
 function avisoOn(t){aviso.textContent=t;aviso.className='aviso on';}
 function avisoOff(){aviso.textContent='';aviso.className='aviso';}
 
 function render(on){
+ ultimoOn=on;
  sw.checked=on;
  lb.textContent=on?'LIGADO':'DESLIGADO';
 }
-function sync(){
- fetch('/api/state',{cache:'no-store'})
-  .then(function(r){return r.json();})
-  .then(function(d){
-    if(!emAcao)render(d.relay==='on');
+// Cor do badge comunica o estado: verde ok, vermelho fora, cinza desconhecido.
+function pintaRede(d){
+ var ok=(d.wifi===3);
+ nb.className='badge'+(ok?' on':' err');
+ nb.title=ok?'Rede conectada':'Rede sem conexao';
+}
 )HTML"
 #ifdef USE_MQTT
-  R"HTML(    mb.textContent=d.mqtt_connected?'MQTT ativo':(d.mqtt?'MQTT offline':'MQTT off');
-    mb.className='badge'+(d.mqtt_connected?' on':'');
+  R"HTML(function pintaMqtt(d){
+ mb.hidden=!d.mqtt;
+ if(!d.mqtt)return;
+ var ok=!!d.mqtt_connected;
+ mb.className='badge'+(ok?' on':' err');
+ mb.title=ok?'MQTT conectado':'MQTT sem conexao com o broker';
+}
+)HTML"
+#endif
+  R"HTML(function comContato(){
+ offline=false;
+ if(!emAcao){avisoOff();sw.disabled=false;}
+}
+function semContato(){
+ offline=true;
+ nb.className='badge';
+ nb.title='Sem conexao com o aparelho';
+)HTML"
+#ifdef USE_MQTT
+  R"HTML( if(!mb.hidden)mb.className='badge';
+)HTML"
+#endif
+  R"HTML( avisoOn('SEM CONEXAO COM O APARELHO');
+ sw.disabled=true;
+}
+function sync(){
+ if(emSync)return;
+ emSync=true;
+ var seq=++syncSeq;
+ var ctl=(typeof AbortController!=='undefined')?new AbortController():null;
+ var to=ctl?setTimeout(function(){ctl.abort();},5000):0;
+ fetch('/api/state',{cache:'no-store',signal:ctl?ctl.signal:undefined})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(seq!==syncSeq)return;
+    falhas=0;
+    comContato();
+    if(!emAcao)render(d.relay==='on');
+    pintaRede(d);
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(    pintaMqtt(d);
 )HTML"
 #endif
   R"HTML(    clk.textContent=d.time_synced?('Relogio do aparelho: '+d.clock):'Aguardando sincronismo NTP';
-    if(d.uptime!==undefined)ftr.textContent='Ativo '+fmtUp(d.uptime)+' \u00B7 Heap '+d.heap+' \u00B7 RSSI '+d.rssi+' dBm';
-    avisoOff();
+    if(d.uptime!==undefined)ftr.textContent='Ligado ha '+fmtUp(d.uptime)+' \u00B7 Heap '+d.heap+(d.rssi!==null?' \u00B7 RSSI '+d.rssi+' dBm':'');
   })
-  .catch(function(){avisoOn('SEM CONEXAO');});
+  .catch(function(){
+    if(seq!==syncSeq)return;
+    // Uma falha isolada nao acende o aviso (evita alarme falso).
+    if(++falhas>=2)semContato();
+  })
+  .finally(function(){
+    if(to)clearTimeout(to);
+    emSync=false;
+  });
 }
 function fmtUp(u){
- if(u>=86400)return (u/86400).toFixed(u>=864000?0:1)+'d';
- if(u>=3600)return (u/3600).toFixed(u>=36000?0:1)+'h';
- return Math.floor(u/60)+'min';
+ if(u<60)return '<1min';
+ if(u<3600)return Math.floor(u/60)+'min';
+ if(u<86400)return Math.floor(u/3600)+'h';
+ var d=Math.floor(u/86400);
+ if(d<=366)return d+'d';
+ return Math.floor(d/365.25)+'a';
 }
 function tgl(on){
+ if(offline){render(ultimoOn);return;}
  emAcao=true;
  sw.disabled=true;
  avisoOn('Sincronizando...');
@@ -915,22 +981,26 @@ function tgl(on){
    render(d.relay==='on');
    avisoOff();
   })
-  .catch(sync)
+  .catch(function(){
+   render(ultimoOn);
+   avisoOff();
+   sync();
+  })
   .finally(function(){
    emAcao=false;
-   sw.disabled=false;
+   sw.disabled=offline;
   });
 }
 )HTML"
 #ifdef USE_MQTT
   R"HTML(function saveMqtt(e){
  e.preventDefault();
- // Formulario de origem (Configuracao ou MQTT): botao e msg sao locais ao form
+ // Formulario de origem: botao e msg sao locais ao form
  var form=e.target,btn=form.querySelector('button[type=submit]'),fm=form.querySelector('.msg');
  btn.disabled=true; fm.textContent='Salvando...';
  // O POST /api/mqtt grava todos os campos de uma vez: envia o payload completo
  var body={server:f1.value.trim(),port:f2.value.trim(),user:f3.value.trim(),
-           pass:f4.value,topic:f5.value.trim(),mdns:f6.value.trim()};
+           pass:f4.value,topic:f5.value.trim()};
  fetch('/api/mqtt',{method:'POST',body:JSON.stringify(body)})
   .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});})
   .then(function(o){
@@ -942,19 +1012,12 @@ function tgl(on){
     if(n<=0){
      clearInterval(iv);
      fm.textContent='Reiniciando...';
-     var novo=(o.d.mdns||'').toLowerCase();
-     var atual=(location.hostname||'').toLowerCase().replace(/\.local$/,'');
-     var ehIp=/^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(location.hostname);
-     if(novo && atual!==novo && !ehIp){
-      esperaBoot('http://'+novo+'.local/',function(){location.href='http://'+novo+'.local/';});
-     }else{
-      esperaBoot('',function(){
-       btn.disabled=false;
-       fm.textContent='Configuracao aplicada!';
-       carregaForm();
-       sync();
-      });
-     }
+     aplicaNovoHost('',function(){
+      btn.disabled=false;
+      fm.textContent='Configuracao aplicada!';
+      carregaForm();
+      sync();
+     });
      return;
     }
     fm.textContent='Salvo! Reiniciando em '+n+'...';
@@ -968,7 +1031,6 @@ function carregaForm(){
   .then(function(r){return r.json();})
   .then(function(d){
    f1.value=d.server||''; f2.value=d.port||''; f3.value=d.user||''; f5.value=d.topic||'';
-   f6.value=d.mdns||'';
    f4.value='';
    f4.placeholder=d.pass_set?'Vazia = mantem a atual':'Sem senha';
   })
@@ -1003,20 +1065,29 @@ function saveSched(e){
 )HTML"
   R"HTML(// Espera o aparelho voltar (max 15s). alvo='' usa a origem atual.
 function esperaBoot(alvo,cb){
+ var base=(alvo||'').replace(/\/+$/,'');
  var t=0;
  var iv=setInterval(function(){
   t++;
-  fetch(alvo+'/api/state',{cache:'no-store'})
+  fetch(base+'/api/state',{cache:'no-store'})
    .then(function(r){clearInterval(iv);cb();})
    .catch(function(){if(t>=15){clearInterval(iv);cb();}});
  },1000);
 }
-)HTML"
-#ifdef USE_MQTT
-  R"HTML(carregaForm();
-)HTML"
-#else
-  R"HTML(function saveMdns(e){
+// DNS e comum aos dois builds: salvar o nome redireciona para o novo host
+// (ou recarrega, quando o acesso foi por IP ou o nome nao mudou).
+function aplicaNovoHost(nome,depois){
+ var novo=(nome||'').toLowerCase();
+ var atual=(location.hostname||'').toLowerCase().replace(/\.local$/,'');
+ var ehIp=/^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(location.hostname);
+ if(novo && atual!==novo && !ehIp){
+  var alvo='http://'+novo+'.local';
+  esperaBoot(alvo,function(){location.href=alvo+'/';});
+  return;
+ }
+ esperaBoot('',function(){if(depois)depois();});
+}
+function saveMdns(e){
  e.preventDefault();
  var form=e.target,btn=form.querySelector('button[type=submit]'),fm=form.querySelector('.msg');
  btn.disabled=true; fm.textContent='Salvando...';
@@ -1031,7 +1102,12 @@ function esperaBoot(alvo,cb){
     if(n<=0){
      clearInterval(iv);
      fm.textContent='Reiniciando...';
-     esperaBoot('',function(){location.reload();});
+     aplicaNovoHost(o.d.mdns,function(){
+      btn.disabled=false;
+      fm.textContent='Configuracao aplicada!';
+      carregaMdns();
+      sync();
+     });
      return;
     }
     fm.textContent='Salvo! Reiniciando em '+n+'...';
@@ -1046,10 +1122,13 @@ function carregaMdns(){
   .then(function(d){f6.value=d.mdns||'';})
   .catch(function(){});
 }
-carregaMdns();
+)HTML"
+#ifdef USE_MQTT
+  R"HTML(carregaForm();
 )HTML"
 #endif
   R"HTML(carregaSched();
+carregaMdns();
 sync();
 setInterval(sync,2000);
 </script>
@@ -1060,6 +1139,21 @@ setInterval(sync,2000);
 // --------------------------------------------------
 // Rotas HTTP
 // --------------------------------------------------
+// Segundos desde o boot, somando os estouros de millis() (49,7 d cada).
+uint32_t uptimeSeconds()
+{
+  uint32_t ms = millis();
+
+  if (ms < uptimeLastMs)
+  {
+    uptimeBase += 4294967UL; // 2^32 ms / 1000
+  }
+
+  uptimeLastMs = ms;
+
+  return uptimeBase + ms / 1000UL;
+}
+
 void handleIndex()
 {
   server.send_P(200, "text/html", PAGE_INDEX);
@@ -1082,16 +1176,36 @@ void handleState()
   json += ",\"clock\":\"";
   json += relogioAtual();
   json += "\",\"uptime\":";
-  json += String(millis() / 1000UL);
+  json += String(uptimeSeconds());
   json += ",\"heap\":";
   json += String(ESP.getFreeHeap());
   json += ",\"rssi\":";
-  json += String(WiFi.RSSI());
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    json += String(WiFi.RSSI());
+  }
+  else
+  {
+    json += "null"; // sem estação conectada não existe RSSI medido
+  }
+
+  json += ",\"wifi\":";
+  json += String((int)WiFi.status());
+  json += ",\"wifi_reason\":";
+  json += String(wifiLastReason);
+  json += ",\"wifi_dropped_at\":";
+  json += String(wifiLastReasonAt / 1000UL);
+  json += ",\"wifi_drops\":";
+  json += String(wifiDrops);
   json += ",\"mdns\":\"";
   json += mdns_host;
   json += "\"}";
 
   server.sendHeader("Cache-Control", "no-store");
+  // Permite que a pagina no host antigo detecte o aparelho no novo nome
+  // (esperaBoot apos salvar o DNS).
+  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
 }
 
@@ -1173,7 +1287,37 @@ void handleNotFound()
 }
 
 // --------------------------------------------------
-// Configuração MQTT pela página
+// Nome mDNS (DNS é núcleo: existe nos dois builds)
+// --------------------------------------------------
+void handleMdnsPost()
+{
+  StaticJsonDocument<256> doc;
+
+  if (deserializeJson(doc, server.arg("plain")))
+  {
+    server.send(400, "application/json", "{\"error\":\"json invalido\"}");
+    return;
+  }
+
+  strlcpy(mdns_host, doc["mdns"] | MDNS_HOST, sizeof(mdns_host));
+  normalizeMdnsHost();
+
+  if (!saveConfig())
+  {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"falha ao salvar\"}");
+    return;
+  }
+
+  restartAt = millis() + 1000;
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json",
+              "{\"ok\":true,\"restart\":1,\"mdns\":\"" + String(mdns_host) + "\"}");
+}
+
+// --------------------------------------------------
+// Configuração MQTT pela página (build com MQTT)
 // --------------------------------------------------
 #ifdef USE_MQTT
 void handleMqttGet()
@@ -1188,9 +1332,7 @@ void handleMqttGet()
   json += mqtt_topic;
   json += "\",\"pass_set\":";
   json += strlen(mqtt_pass) > 0 ? "true" : "false";
-  json += ",\"mdns\":\"";
-  json += mdns_host;
-  json += "\"}";
+  json += "}";
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
@@ -1223,7 +1365,6 @@ void handleMqttPost()
   strlcpy(mqtt_port, port, sizeof(mqtt_port));
   strlcpy(mqtt_user, doc["user"] | "", sizeof(mqtt_user));
   strlcpy(mqtt_topic, doc["topic"] | MQTT_OUTPUT_TOPIC, sizeof(mqtt_topic));
-  strlcpy(mdns_host, doc["mdns"] | MDNS_HOST, sizeof(mdns_host));
 
   // Senha vazia = mantém a atual
   const char *pass = doc["pass"] | "";
@@ -1234,7 +1375,6 @@ void handleMqttPost()
   }
 
   normalizeMqttConfig();
-  normalizeMdnsHost();
 
   if (!saveConfig())
   {
@@ -1249,35 +1389,7 @@ void handleMqttPost()
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json",
-              "{\"ok\":true,\"restart\":1,\"mdns\":\"" + String(mdns_host) + "\"}");
-}
-#else
-// Build SEM MQTT: o formulário "Configuracao" salva só o nome mDNS
-void handleMdnsPost()
-{
-  StaticJsonDocument<256> doc;
-
-  if (deserializeJson(doc, server.arg("plain")))
-  {
-    server.send(400, "application/json", "{\"error\":\"json invalido\"}");
-    return;
-  }
-
-  strlcpy(mdns_host, doc["mdns"] | MDNS_HOST, sizeof(mdns_host));
-  normalizeMdnsHost();
-
-  if (!saveConfig())
-  {
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(500, "application/json", "{\"ok\":false,\"error\":\"falha ao salvar\"}");
-    return;
-  }
-
-  restartAt = millis() + 1000;
-
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json",
-              "{\"ok\":true,\"restart\":1,\"mdns\":\"" + String(mdns_host) + "\"}");
+              "{\"ok\":true,\"restart\":1}");
 }
 #endif // USE_MQTT
 
@@ -1403,6 +1515,14 @@ void setup()
   // Diagnóstico de queda/conexão com o motivo exato informado pelo core
   WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &info)
                                  {
+    // Guarda o motivo para o /api/state (diagnóstico sem acesso serial)
+    wifiLastReason = (uint8_t)info.reason;
+    wifiLastReasonAt = millis();
+    if (wifiDrops < 0xFFFF)
+    {
+      wifiDrops++;
+    }
+
     Serial.print("Wi-Fi desconectado (motivo ");
     Serial.print(info.reason);
     Serial.print(": ");
@@ -1553,11 +1673,11 @@ void setup()
   server.on("/", HTTP_GET, handleIndex);
   server.on("/api/state", HTTP_GET, handleState);
   server.on("/relay", HTTP_GET, handleRelay);
+  // DNS é núcleo: a rota existe nos dois builds
+  server.on("/api/mdns", HTTP_POST, handleMdnsPost);
 #ifdef USE_MQTT
   server.on("/api/mqtt", HTTP_GET, handleMqttGet);
   server.on("/api/mqtt", HTTP_POST, handleMqttPost);
-#else
-  server.on("/api/mdns", HTTP_POST, handleMdnsPost);
 #endif
   server.on("/api/schedule", HTTP_GET, handleScheduleGet);
   server.on("/api/schedule", HTTP_POST, handleSchedulePost);
@@ -1674,7 +1794,7 @@ void loop()
     wifiNextStats = agoraMs + 60000UL;
 
     Serial.print("[status] uptime=");
-    Serial.print(agoraMs / 1000UL);
+    Serial.print(uptimeSeconds());
     Serial.print("s heap=");
     Serial.print(ESP.getFreeHeap());
     Serial.print(" rssi=");

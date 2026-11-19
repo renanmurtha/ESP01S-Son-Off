@@ -41,43 +41,46 @@ Se o seu módulo de relé for ativo em `HIGH`, comente a linha `#define RELAY_AC
 ### Controle do relé
 - Liga/desliga por página web, por MQTT (build com MQTT) e por agendamento.
 - O estado é persistido em `config.json` no SPIFFS e restaurado no boot.
-- No build com MQTT, ao mudar o estado é publicado no MQTT (mensagem retida).
+- No build com MQTT, o estado é publicado **somente quando muda** (mensagem retida) e a entrega é feita por um único ponto, com pendência em RAM: se o broker estiver fora, o próximo ciclo entrega o estado atual. Presença (`online`/`offline`) **não** é publicada nem gravada — ela é sessão e aparece apenas na página.
 
 ### Página web (`/`)
 Interface em português, responsiva e em tema escuro, com:
 - Cartão do relé com interruptor (switch) e rótulo `LIGADO`/`DESLIGADO` — o rótulo mostra apenas o estado do relé.
-- Label de aviso na linha do hostname, à direita, exibida só quando necessário: `Sincronizando...` enquanto o toggle aguarda o backend (o interruptor fica desabilitado até a resposta) e `SEM CONEXAO` quando a página perde contato com o aparelho.
-- Badge de status do MQTT (`MQTT ativo` / `MQTT offline` / `MQTT off`) — apenas no build com MQTT.
+- Label de aviso na **linha do hostname, à direita** (11 px, uma linha): `Sincronizando...` enquanto o toggle aguarda o backend e `SEM CONEXÃO COM O APARELHO` quando a página perde contato com o ESP. Nesse estado o interruptor fica desabilitado. A linha tem altura fixa e não quebra, então a mensagem aparece e some sem mover o cartão nem o switch.
+- Dois badges de texto fixo, **`Rede`** e **`MQTT`** (este só no build com MQTT e só quando o MQTT está configurado): a **cor** informa o estado — verde = ok, vermelho = fora, cinza = sem contato com o aparelho. O estado completo vai em `title`/`aria-label`.
 - Exibição do endereço de acesso (hostname) e do relógio do aparelho.
-- Rodapé com uptime, heap livre e RSSI do Wi-Fi.
-- `SEM CONEXAO` aparece na label de aviso (linha do hostname) quando a página perde contato com o aparelho; o cartão mantém o último estado conhecido e a label some no primeiro sync bem-sucedido.
-- Sincronização automática do estado a cada 2 segundos.
-- Seções expansíveis de **Configuração**, **Automação** e, no build com MQTT, **MQTT**.
+- Rodapé separado por uma linha, com `Ligado há <tempo>` (uptime do aparelho — `min`, `h`, `d` até 366 dias e depois `a`, ex.: `37min`, `5h`, `9d`, `366d`, `1a`), heap livre e RSSI do Wi-Fi (RSSI só quando há estação conectada).
+- `SEM CONEXÃO COM O APARELHO` aparece quando a página perde contato (falhas seguidas de sincronização); o cartão mantém o último estado conhecido e a mensagem some no primeiro sync bem-sucedido.
+- Sincronização automática do estado a cada 2 segundos, sem sobrepor requisições (timeout de 5 s).
+- Seções expansíveis de **Configuração** (nome mDNS, comum aos dois builds), **Automação** e, no build com MQTT, **MQTT**.
 
 ### Servidor web + API
 | Rota | Método | Descrição |
 | --- | --- | --- |
 | `/` | GET | Página de controle |
-| `/api/state` | GET | Estado do relé, MQTT (build com MQTT), relógio, uptime, heap, RSSI e mDNS |
+| `/api/state` | GET | Estado do relé, diagnóstico de rede (Wi-Fi + motivo da última queda), MQTT (build com MQTT), relógio, uptime, heap, RSSI e mDNS |
 | `/relay` | GET | Controla o relé (`?state=on\|off\|toggle`) |
-| `/api/mqtt` | GET/POST | Configuração de MQTT e mDNS (build **com** MQTT; o POST reinicia o aparelho) |
-| `/api/mdns` | POST | Salva o nome mDNS (build **sem** MQTT; reinicia o aparelho) |
+| `/api/mqtt` | GET/POST | Configuração de MQTT (build **com** MQTT; o POST reinicia o aparelho). Não grava mais o nome mDNS |
+| `/api/mdns` | POST | Salva o nome mDNS (**nos dois builds**; reinicia o aparelho) |
 | `/api/schedule` | GET | Lê os agendamentos |
 | `/api/schedule` | POST | Salva os agendamentos |
 
 Resposta de `/api/state`:
 ```json
-{ "relay": "on", "gpio": 0, "mqtt": true, "mqtt_connected": true, "time_synced": true, "clock": "08:30:00", "uptime": 3600, "heap": 38896, "rssi": -66, "mdns": "esp01s-rele" }
+{ "relay": "on", "gpio": 0, "mqtt": true, "mqtt_connected": true, "time_synced": true, "clock": "08:30:00", "uptime": 3600, "heap": 38896, "rssi": -66, "wifi": 3, "wifi_reason": 0, "wifi_dropped_at": 0, "wifi_drops": 0, "mdns": "esp01s-rele" }
 ```
 
+> `wifi` é o status do `WiFi.status()` (3 = conectado); `wifi_reason` é o motivo da última desconexão (0 = nenhuma desde o boot); `wifi_drops` conta as quedas desde o boot; `rssi` é `null` sem estação conectada. Esses campos existem **nos dois builds**.
 > No build **sem** MQTT os campos `mqtt`/`mqtt_connected` não existem no JSON.
 
 ### MQTT *(build com MQTT)*
 - **Habilitado** apenas quando há um servidor e uma porta válida (1–65535).
 - **Tópico base** configurável (padrão `iot/leds/output`), com barra final removida automaticamente.
-- Publica o estado no tópico base (**retido**) e assina os comandos em `iot/leds/input`.
+- Publica o estado no tópico base (**retido**) **apenas quando o estado muda**; a publicação existe em um único ponto (`mqttFlush()`).
+- Se o MQTT estiver fora quando o relé muda, a publicação fica **pendente em RAM** (só o estado final, coalescido) e sai quando a conexão volta; um reboot antes disso descarta o envio, mas o relé continua no estado correto (persistido em `config.json`).
+- Assina os comandos em `iot/leds/input`.
 - Comandos aceitos: `ON`/`1`, `OFF`/`0` e `TOGGLE`.
-- Usa **LWT** (Last Will) para marcar `availability` como `offline` na queda e `online` ao conectar.
+- **Sem LWT**: presença (`online`/`offline`) é sessão, não status — não é publicada nem gravada; a página mostra o estado da rede e do MQTT em badges separados.
 - Reconexão **não bloqueante** com backoff de 2s, 5s, 15s, 30s (a página web continua respondendo).
 - Reconexão imediata quando o Wi-Fi volta.
 - KeepAlive de 15s, socket timeout de 3s e buffer de 512 bytes.
@@ -90,7 +93,7 @@ Payload publicado no tópico base:
   "sensor": "Iluminação",
   "macAddress": "<MAC>",
   "chipId": "<chip id>",
-  "message": { "availability": "online", "state": "ON" }
+  "message": { "state": "ON" }
 }
 ```
 
@@ -187,6 +190,7 @@ Fluxo resumido: **broker Aedes (Node-RED) → nó MQTT → Function (acima) → 
 - Configuração salva é relida e normalizada após a conexão (vale para o portal do boot e para o portal de 8 h).
 
 ### Resiliência de Wi-Fi e diagnóstico
+- **Uptime imune ao overflow de `millis()`**: o contador de 32 bits estoura em ~49,7 dias; o firmware acumula os segundos antes do estouro (`uptimeSeconds()`), então `Ligado há` continua correto depois disso.
 - **Modem sleep desativado** (`WIFI_NONE_SLEEP`) em todos os cenários — evita quedas por *beacon timeout* com roteadores sensíveis.
 - **Reconexão ativa com fallback** (o auto-reconnect do core pode falhar silenciosamente). Queda de rede nunca abre o configurador — nem no boot, nem durante o ciclo:
   | Tempo sem rede | Ação |
@@ -221,6 +225,7 @@ Para recuperação do aparelho (ex.: perdido na rede com nome/IP que não lembra
 - Durante o OTA os reinícios agendados são cancelados, o loop de MQTT/agendamento é pausado e (no build com MQTT) o cliente MQTT é desconectado.
 - Progresso do OTA exibido no serial a cada 10%.
 - mDNS reiniciado automaticamente quando o Wi-Fi volta, com fallback para `esp01s-rele` se o hostname normalizado falhar.
+- Ao salvar um nome mDNS novo, a página espera o aparelho reiniciar e redireciona para `http://<novo-nome>.local/` — comportamento idêntico nos dois builds (acesso por IP apenas recarrega).
 - Logs no serial (115200 baud): estado do relé, mensagens MQTT (build com MQTT) e os diagnósticos da seção acima.
 
 ## Bibliotecas utilizadas
