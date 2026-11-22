@@ -18,8 +18,8 @@ build_flags = -DUSE_MQTT
 
 | Estado da flag | Flash | RAM |
 | --- | --- | --- |
-| Ativa (com MQTT) | ~461 KB (48,2%) | 41,9% |
-| Comentada (sem MQTT) | ~451 KB (47,0%) | 40,7% |
+| Ativa (com MQTT) | ~467 KB (48,7%) | 43,4% |
+| Comentada (sem MQTT) | ~455 KB (47,5%) | 42,0% |
 
 Compile com `pio run` (ou pelo botão do PlatformIO) após ajustar a flag.
 
@@ -41,6 +41,7 @@ Se o seu módulo de relé for ativo em `HIGH`, comente a linha `#define RELAY_AC
 ### Controle do relé
 - Liga/desliga por página web, por MQTT (build com MQTT) e por agendamento.
 - O estado é persistido em `config.json` no SPIFFS e restaurado no boot.
+- **Queda de energia:** se o reset foi causado por falta de energia (`Power On`/`External System`), o relé é reconciliado com a janela do agendamento assim que o relógio sincroniza — não fica no estado antigo esperando o próximo horário.
 - No build com MQTT, o estado é publicado **somente quando muda** (mensagem retida) e a entrega é feita por um único ponto, com pendência em RAM: se o broker estiver fora, o próximo ciclo entrega o estado atual. Presença (`online`/`offline`) **não** é publicada nem gravada — ela é sessão e aparece apenas na página.
 
 ### Página web (`/`)
@@ -173,12 +174,14 @@ Fluxo resumido: **broker Aedes (Node-RED) → nó MQTT → Function (acima) → 
 - Horários de **ligar** e **desligar** independentes, no formato `HH:MM`, com opção de habilitar cada um.
 - Relógio via **NTP** (`a.ntp.br`, `b.ntp.br`, `c.ntp.br`) com fuso fixo **BRT (UTC-3)**, sem horário de verão.
 - Dispara uma única vez por dia (deduplicação por ano + dia do ano).
-- Detecta o cruzamento do horário entre duas amostras do loop: se o loop atrasar, dispara no próximo ciclo; a primeira amostra após o boot/sincronismo **nunca** dispara atrasado.
+- Detecta o cruzamento do horário entre duas amostras do loop: se o loop atrasar, dispara no próximo ciclo; a primeira amostra após o boot/sincronismo não dispara **pela borda** (não há disparo duplicado ao ligar).
+- **Reconciliação pós-queda de energia:** quando o reset foi causado por falta de energia (`Power On`/`External System`), o estado do relé é recalculado a partir da janela do agendamento na primeira leitura válida do relógio (depois do NTP) e corrigido se necessário — recupera a borda que ocorreu com o aparelho desligado. Com os dois horários habilitados vale a janela (inclusive virada de meia-noite); com apenas um, o evento só força o estado depois do horário. Reinícios por OTA, crash ou salvamento de configuração **não** reconciliam: mantêm o estado salvo.
 - Se ligar e desligar estiverem no mesmo horário, os dois são ignorados com aviso no serial.
 - Nada acontece enquanto o NTP não sincroniza.
 
 ### Configuração e persistência
 - `config.json` (SPIFFS) guarda: hostname mDNS, estado do relé e agendamentos — e, no build com MQTT, servidor/porta/usuário/senha/tópico MQTT. (Campos MQTT de um config antigo são ignorados pelo build sem MQTT.)
+- Gravação **atômica**: o novo conteúdo vai para `config.tmp` e só substitui o `config.json` depois de completo e fechado; o arquivo anterior vira `config.bak`. Se uma queda de energia truncar o `config.json`, o boot lê o `config.bak` — a programação não se perde.
 - Normalizações automáticas: porta padrão `1883` quando há servidor sem porta, tópico padrão quando vazio, horários inválidos voltam para `06:00`/`22:00`, e o nome mDNS é truncado em 31 caracteres e limitado a `[A-Za-z0-9-_.]` (com remoção do sufixo `.local`).
 - Salvar a configuração pela página **reinicia o aparelho** para aplicar tudo.
 - Na página, deixar o campo de senha vazio **mantém a senha atual**.
@@ -216,7 +219,7 @@ Para recuperação do aparelho (ex.: perdido na rede com nome/IP que não lembra
   ```
 - **Sem o `#define` (padrão do repositório), o endpoint nem é registrado** — toda tentativa responde 404, como qualquer rota inexistente.
 - Uso: acesse no navegador `http://<ip>/reset/p=<senha>`.
-  - **Senha correta:** apaga `config.json` (MQTT, mDNS, agendamentos, estado do relé), apaga as credenciais Wi-Fi (`ESP.eraseConfig()`) e reinicia — no boot, o WiFiManager abre o AP `ESP01S-RELE` para configurar do zero. Resposta: `{"ok":true,"restart":1}`.
+  - **Senha correta:** apaga `config.json`, `config.bak` e `config.tmp` (MQTT, mDNS, agendamentos, estado do relé), apaga as credenciais Wi-Fi (`ESP.eraseConfig()`) e reinicia — no boot, o WiFiManager abre o AP `ESP01S-RELE` para configurar do zero. Resposta: `{"ok":true,"restart":1}`.
   - **Senha errada:** responde 404 com 1 segundo de atraso (dificulta força bruta), sem revelar que a rota existe.
 - Funciona nos dois builds (com e sem MQTT). Vale apenas na rede local, via HTTP — use para recuperação, não como mecanismo remoto de administração.
 

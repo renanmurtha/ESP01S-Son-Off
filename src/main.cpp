@@ -288,6 +288,66 @@ bool timeSynced()
 }
 
 // --------------------------------------------------
+// Estado que o agendamento determina para um minuto do dia.
+//  1 = LIGADO, 0 = DESLIGADO, -1 = o agendamento não decide
+//  (nada habilitado, horário inválido, ON == OFF ou evento
+//  ainda não ocorreu hoje).
+// --------------------------------------------------
+int8_t estadoDesejado(int minutoDoDia)
+{
+  bool onOk = schedOnEn && isValidHhMm(schedOn);
+  bool offOk = schedOffEn && isValidHhMm(schedOff);
+
+  if (onOk && offOk)
+  {
+    // Janela fechada (trata a virada de meia-noite)
+    int onMin = hhMmToMinutes(schedOn);
+    int offMin = hhMmToMinutes(schedOff);
+
+    if (onMin == offMin)
+    {
+      return -1; // conflito: o agendamento não define o estado
+    }
+
+    if (onMin < offMin)
+    {
+      return (minutoDoDia >= onMin && minutoDoDia < offMin) ? 1 : 0;
+    }
+
+    return (minutoDoDia >= onMin || minutoDoDia < offMin) ? 1 : 0;
+  }
+
+  // Só um horário habilitado: antes do evento o estado salvo manda.
+  if (onOk)
+  {
+    return (minutoDoDia >= hhMmToMinutes(schedOn)) ? 1 : -1;
+  }
+
+  if (offOk)
+  {
+    return (minutoDoDia >= hhMmToMinutes(schedOff)) ? 0 : -1;
+  }
+
+  return -1;
+}
+
+// --------------------------------------------------
+// A queda de energia apaga a RAM do RTC: o ESP volta com
+// reset "Power On" (ou "External System", quando o circuito
+// de reset/brownout dispara). Só nesses casos o relé é
+// reconciliado com o agendamento no boot.
+// A comparação ignora maiúsculas/minúsculas porque a grafia
+// do motivo mudou entre versões do core.
+// --------------------------------------------------
+bool resetPorQuedaDeEnergia()
+{
+  String motivo = ESP.getResetReason();
+  motivo.toLowerCase();
+
+  return motivo == "power on" || motivo == "external system";
+}
+
+// --------------------------------------------------
 // Relógio local atual no formato "HH:MM:SS"
 // (vazio enquanto o NTP não sincronizar)
 // --------------------------------------------------
@@ -308,6 +368,38 @@ String relogioAtual()
   return String(buf);
 }
 
+// Arquivos de configuração.
+// A gravação é atômica: o novo conteúdo vai para o .tmp e só substitui
+// o .json depois de completo e fechado; o anterior vira .bak.
+#define CONFIG_FILE "/config.json"
+#define CONFIG_TMP "/config.tmp"
+#define CONFIG_BAK "/config.bak"
+
+// --------------------------------------------------
+// Lê e valida um arquivo de configuração
+// --------------------------------------------------
+bool lerConfigJson(StaticJsonDocument<1024> &doc, const char *path)
+{
+  doc.clear();
+
+  if (!SPIFFS.exists(path))
+  {
+    return false;
+  }
+
+  File file = SPIFFS.open(path, "r");
+
+  if (!file)
+  {
+    return false;
+  }
+
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+
+  return !error;
+}
+
 // --------------------------------------------------
 // Carrega as configurações
 // --------------------------------------------------
@@ -317,28 +409,17 @@ void loadConfig()
   // o relé fica desligado.
   relayState = false;
 
-  if (!SPIFFS.exists("/config.json"))
-  {
-    Serial.println("Configuracao inicial.");
-    return;
-  }
-
-  File file = SPIFFS.open("/config.json", "r");
-
-  if (!file)
-  {
-    Serial.println("Erro ao abrir config.json.");
-    return;
-  }
-
   StaticJsonDocument<1024> doc;
-  DeserializationError error = deserializeJson(doc, file);
-  file.close();
 
-  if (error)
+  if (!lerConfigJson(doc, CONFIG_FILE))
   {
-    Serial.println("Erro ao ler JSON.");
-    return;
+    if (!lerConfigJson(doc, CONFIG_BAK))
+    {
+      Serial.println("Configuracao inicial.");
+      return;
+    }
+
+    Serial.println("config.json ausente ou ilegivel: usando backup.");
   }
 
 #ifdef USE_MQTT
@@ -385,7 +466,7 @@ bool saveConfig()
   doc["sched_on_en"] = schedOnEn;
   doc["sched_off_en"] = schedOffEn;
 
-  File file = SPIFFS.open("/config.json", "w");
+  File file = SPIFFS.open(CONFIG_TMP, "w");
 
   if (!file)
   {
@@ -396,12 +477,37 @@ bool saveConfig()
   bool ok = serializeJson(doc, file) > 0;
   file.close();
 
-  if (ok)
+  if (!ok)
   {
-    Serial.println("Configuracoes salvas.");
+    SPIFFS.remove(CONFIG_TMP);
+    Serial.println("Erro ao salvar config.json.");
+    return false;
   }
 
-  return ok;
+  // Troca atômica: o arquivo em uso só é substituído depois que o novo
+  // está completo e fechado. O anterior vira .bak (fallback de leitura
+  // caso uma queda de energia trunque o .json).
+  SPIFFS.remove(CONFIG_BAK);
+
+  if (SPIFFS.exists(CONFIG_FILE))
+  {
+    SPIFFS.rename(CONFIG_FILE, CONFIG_BAK);
+  }
+
+  if (!SPIFFS.rename(CONFIG_TMP, CONFIG_FILE))
+  {
+    if (SPIFFS.exists(CONFIG_BAK))
+    {
+      SPIFFS.rename(CONFIG_BAK, CONFIG_FILE); // restaura o anterior
+    }
+
+    SPIFFS.remove(CONFIG_TMP);
+    Serial.println("Erro ao salvar config.json (rename).");
+    return false;
+  }
+
+  Serial.println("Configuracoes salvas.");
+  return true;
 }
 
 // --------------------------------------------------
@@ -505,18 +611,16 @@ void setRelay(bool on, bool persist = true)
 // O gatilho é por cruzamento entre duas amostras do loop: se o
 // loop atrasar (MQTT/OTA/reboot), dispara atrasado no próximo
 // loop; a primeira amostra após boot/sincronismo não dispara
-// (nunca atuar atrasado logo ao ligar).
+// pela borda.
+// Se o reset foi queda de energia, o estado do relé é
+// reconciliado com a janela do agendamento na primeira leitura
+// válida do relógio (recupera as bordas perdidas na queda).
 // --------------------------------------------------
 void handleSchedule()
 {
-  if (!schedOnEn && !schedOffEn)
-  {
-    return;
-  }
-
   if (!timeSynced())
   {
-    return;
+    return; // sem relógio não há agendamento nem reconciliação
   }
 
   time_t now = time(nullptr);
@@ -524,6 +628,37 @@ void handleSchedule()
   localtime_r(&now, &t);
 
   int minuteOfDay = t.tm_hour * 60 + t.tm_min;
+
+  // Reconciliação pós-queda de energia: uma única vez, na primeira
+  // leitura válida do relógio (depois do NTP). Se a queda atravessou
+  // um horário do agendamento, a borda foi perdida e o relé ficou no
+  // estado antigo; aqui ele é corrigido para o estado da janela atual.
+  static bool reconciliado = false;
+
+  if (!reconciliado)
+  {
+    reconciliado = true;
+
+    if (resetPorQuedaDeEnergia())
+    {
+      int8_t desejado = estadoDesejado(minuteOfDay);
+
+      Serial.print("Agendamento: queda de energia, desejado=");
+      Serial.print(desejado < 0 ? "indefinido" : (desejado ? "ON" : "OFF"));
+      Serial.print(" atual=");
+      Serial.println(relayState ? "ON" : "OFF");
+
+      if (desejado >= 0 && (bool)desejado != relayState)
+      {
+        setRelay(desejado == 1);
+      }
+    }
+  }
+
+  if (!schedOnEn && !schedOffEn)
+  {
+    return;
+  }
 
   // Última amostra do relógio vista pelo loop (mantida entre chamadas)
   static bool temAmostra = false;
@@ -1256,10 +1391,11 @@ void handleSecretReset(const String &senha)
 
   Serial.println("Reset: acionado, apagando configuracao...");
 
-  if (SPIFFS.exists("/config.json"))
-  {
-    SPIFFS.remove("/config.json");
-  }
+  // Apaga a config e também a cópia de segurança (senão o boot
+  // restauraria a configuração que o reset deveria eliminar).
+  SPIFFS.remove(CONFIG_FILE);
+  SPIFFS.remove(CONFIG_BAK);
+  SPIFFS.remove(CONFIG_TMP);
 
   ESP.eraseConfig();
 
